@@ -152,6 +152,21 @@ No coding experience needed to add a translation — it's just a Python dictiona
 
 ---
 
+## The AI Development Journey (Domain Knowledge > Prompt Engineering)
+
+This project was a deep dive into using AI not just as a chatbot, but as a development partner. As a Cybersecurity Engineer, my goal was to see if "prompting" could produce a production-grade tool if given strict architectural guardrails.
+
+I moved from simple mobile prompts to a full CLI/IDE workflow (Claude CLI, Gemini, and VS Code). To manage the "AI memory" and maintain the **"Safe Move"** philosophy, I developed a system of **Agent Instruction (.md) files** (found in the `agent_docs` folder).
+
+These files served as the source of truth for the AI, specifically:
+- **`service_architecture.md`** & **`service_communication_patterns.md`**: Defined how the GUI talks to the backend security logic.
+- **`code_conventions.md`**: Enforced strict logging, tracking, and rollback logic (essential for system security).
+- **`building_the_project.md`**: Kept the AI from hallucinating dependencies.
+- **`known_bugs.md`**: A shared memory space to ensure we didn't fix one thing and break another.
+
+Feel free to explore the `agent_docs` folder to see how these guardrails were built!
+---
+
 ## License
 
 MIT — free to use, modify, and share.
@@ -161,6 +176,6 @@ MIT — free to use, modify, and share.
 ## Author
 
 Built by [@playdoggs](https://github.com/playdoggs)  
-Started as a personal homelab security tool — grew into something more useful.
+Started as a personal homelab security tool — grew into something more useful...maybe.
 
 *If this helped you, give it a ⭐ — it helps others find it.*
