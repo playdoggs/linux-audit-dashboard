@@ -25,6 +25,10 @@
 - `get_system_info()` — hostname/distro/kernel for reports + startup banner
 - `check_update_age()` — last `apt update` timestamp → health face
 - `check_sudo_cached()` — non-blocking sudo state probe
+- `timeshift_is_configured()` — true iff timeshift is installed **and** has a config at `/etc/timeshift/timeshift.json`
+- `create_timeshift_snapshot(password, comment, terminal, timeout=600)` — sync call; returns False on failure so caller can abort
+- `run_temperature_check(terminal, findings)` — parses `sensors` output into per-sensor findings (read-only, no sudo)
+- `run_drive_health_check(terminal, findings, parent_widget)` — `sudo smartctl -H` per physical drive; never uses `-t`
 
 ## Data flow
 - Scans → `FindingsTable` → `score_changed` → `RiskScorePanel`

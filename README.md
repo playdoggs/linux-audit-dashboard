@@ -24,6 +24,8 @@ This tool assumes you don't — and that's fine.
 - **One-click fixes** with a confirmation dialog that shows exactly what will run before anything happens
 - **Guided Fix Wizard** — step-by-step walkthroughs for common security fixes
 - **Tool Manager** — installs and explains security/monitoring tools like rkhunter, fail2ban, smartmontools
+- **Hardware health** — live CPU / GPU / drive temperatures via lm-sensors; SMART self-assessment via smartmontools (read-only, never runs destructive self-tests)
+- **Timeshift integration** — optional one-click snapshot before any destructive action; the action is aborted if the snapshot fails
 - **RUN EVERYTHING** — chains every non-sudo scan and opens a good / needs-fixing summary dialog
 - **Offline-aware** — detects no internet and advises you; CVE and tool install gracefully skip with a clear message
 - **Live progress in terminal** — every multi-item scan shows `[N/TOTAL] …` as it runs
@@ -140,10 +142,10 @@ python3 linux-security-dashboard.py
 - [x] Offline detection and graceful "requires internet" messaging
 - [x] Live `[N/TOTAL]` progress output in terminal for multi-item scans
 - [x] Hostname-tagged report filenames + one-click auto-open in browser
+- [x] Hardware temperature check (lm-sensors) — parses per-sensor thresholds into findings
+- [x] Drive health check (smartmontools) — read-only SMART self-assessment, never runs `-t`
+- [x] Optional Timeshift snapshot before destructive actions — aborts the action if the snapshot fails
 - [ ] Full Fedora/Arch parity (package manager hooks done; CVE/inventory scans still apt-only)
-- [ ] Timeshift snapshot before actions
-- [ ] Drive health (smartmontools integration)
-- [ ] Live temperature monitoring (lm-sensors)
 - [ ] .deb package for easy install
 - [ ] PPA submission
 

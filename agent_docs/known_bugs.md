@@ -26,3 +26,6 @@ None tracked. File a new `### N) …` block when one surfaces.
 - CVE HTTP uses a TLS context + bounded retries.
 - `CvePanel` is shared by CVE and updates scans — both entry points clear `cve_table` on start.
 - Internet-dependent features gate on `has_internet()`; they advise the user when offline instead of hanging on urllib timeouts.
+- **`smartctl` is invoked with `-H` only — never `-t`.** `-t` instructs the drive firmware to run destructive/long self-tests and must never be called without explicit user opt-in.
+- Drive names from `lsblk` are validated with `^[a-zA-Z0-9]+$` before being composed into `/dev/<name>` argv — defence in depth even though argv avoids shell interpolation.
+- Timeshift snapshot failure ABORTS the pending action. Never swallow the failure and let the destructive command run anyway.

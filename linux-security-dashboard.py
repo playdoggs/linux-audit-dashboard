@@ -476,6 +476,8 @@ LANGS = {
         "btn_quick":"⚡  Quick Security Checks",
         "btn_lynis":"🛡  Run Lynis Full Audit",
         "btn_wizard":"🔧  Step-by-Step Fix Wizard",
+        "btn_temperature":"🌡  Check Hardware Temperatures",
+        "btn_drives":"💾  Check Drive Health (SMART)",
         "btn_cve":"🎯  Check for Known Vulnerabilities",
         "btn_upgrades":"📋  Check for Available Updates",
         "btn_tools":"🧰  View Recommended Tools",
@@ -665,6 +667,62 @@ def check_sudo_cached():
         return result.returncode == 0
     except Exception:
         return False
+
+def timeshift_is_configured():
+    """Return True iff timeshift is installed AND has been configured.
+    Timeshift refuses to run `--create` without a config file written by
+    the first-run setup (`sudo timeshift-gtk` or `sudo timeshift --btrfs`/
+    `--rsync`). Without this probe we'd fire a sudo prompt that fails
+    immediately with a cryptic error — bad UX."""
+    if not shutil.which("timeshift"):
+        return False
+    return Path("/etc/timeshift/timeshift.json").exists()
+
+def create_timeshift_snapshot(password, comment, terminal, timeout=600):
+    """Create a Timeshift on-demand snapshot before a destructive action.
+
+    `password`: sudo password as bytes (required — timeshift always needs root).
+    `comment`:  short text stored with the snapshot; shown in timeshift's UI.
+    `timeout`:  seconds before giving up. 10 minutes is a realistic ceiling for
+                rsync snapshots on slow spinning disks; btrfs snapshots return
+                in under a second.
+
+    Returns True on success. On failure the caller should NOT proceed with
+    the action — the whole point of the snapshot is the safety net."""
+    terminal.append(
+        "\n📸  TIMESHIFT SNAPSHOT — creating safety net before action\n"
+        f"   Comment: {comment}\n"
+        "   This writes to your snapshot partition. On slow disks or near-full\n"
+        "   partitions it can take several minutes or fail outright. If it\n"
+        "   fails, the action is ABORTED so nothing is changed.",
+        T["ACCENT"],
+    )
+    try:
+        r = subprocess.run(
+            ["sudo", "-S", "timeshift", "--create",
+             "--comments", comment, "--tags", "D"],
+            input=password + b"\n",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        terminal.append_err(
+            f"Timeshift timed out after {timeout}s — snapshot may be incomplete."
+        )
+        return False
+    except Exception as e:
+        terminal.append_err(f"Timeshift error: {e}")
+        return False
+
+    out = (r.stdout or b"").decode(errors="replace")
+    err = (r.stderr or b"").decode(errors="replace")
+    if r.returncode == 0:
+        terminal.append_ok("Timeshift snapshot created successfully.")
+        return True
+    terminal.append_err(
+        f"Timeshift failed (exit {r.returncode}):\n{out}\n{err}"
+    )
+    return False
 
 def has_internet(timeout=2.0):
     """Best-effort connectivity probe for features that need the internet
@@ -1674,6 +1732,30 @@ class PreActionDialog(QDialog):
             )
             layout.addWidget(ul)
 
+        # Optional Timeshift snapshot checkbox — only shown when timeshift
+        # is installed AND configured. Default ON because the whole point of
+        # offering this is "safety net before destructive change"; users who
+        # know they don't need it can untick for faster operations.
+        self.snapshot_cb = None
+        if timeshift_is_configured():
+            self.snapshot_cb = QCheckBox(
+                "📸  Create a Timeshift snapshot first (rollback safety net)"
+            )
+            self.snapshot_cb.setChecked(True)
+            self.snapshot_cb.setStyleSheet(
+                f"color:{T['ACCENT']};font-size:{fs(-1)}px;"
+            )
+            layout.addWidget(self.snapshot_cb)
+            note = QLabel(
+                "   Slow disks or near-full snapshot partitions can take "
+                "minutes or fail. If the snapshot fails the action is aborted."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                f"color:{T['TEXT_DIM']};font-size:{fs(-2)}px;"
+            )
+            layout.addWidget(note)
+
         # Confirm/Cancel buttons
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -2276,6 +2358,24 @@ class FindingsTable(QWidget, WorkerMixin):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        # If the user ticked the snapshot checkbox, create one BEFORE touching
+        # anything. A failed snapshot aborts the action — the whole point is
+        # to guarantee a rollback target exists before destructive changes.
+        if dlg.snapshot_cb is not None and dlg.snapshot_cb.isChecked():
+            ok = create_timeshift_snapshot(
+                sudo_password,
+                f"audit-dashboard: before {action_type} '{name}'",
+                self.terminal,
+            )
+            if not ok:
+                self.terminal.append_warn(
+                    "Action ABORTED because the Timeshift snapshot failed. "
+                    "Fix the snapshot problem (usually free up disk space on "
+                    "the snapshot partition) and try again, or untick the "
+                    "snapshot checkbox to proceed without one."
+                )
+                return
+
         self.terminal.append_cmd(f"sudo {cmd}")
 
         # Prepare the undo log entry
@@ -2573,6 +2673,271 @@ def run_quick_checks(terminal, findings):
     )
     SESSION.log_scan("Quick Security Checks", len(CHECKS) - passed)
     return passed
+
+
+# ── Hardware temperature check (lm-sensors) ──────────────────────────────────
+# Parses the output of `sensors` into per-reading findings. No sudo required;
+# lm-sensors reads kernel thermal zones already exposed to all users. The only
+# "risk" here is informational — we surface hot components before they cause
+# thermal throttling, crashes, or silicon damage.
+
+# Matches a line like:  Core 0:  +45.0°C  (high = +80.0°C, crit = +100.0°C)
+# and also the simpler:  Composite:  +42.9°C
+_SENSORS_LINE_RE = re.compile(
+    r"^\s*(?P<name>[^:]+?):\s*[+\-]?(?P<cur>[\d.]+)\s*°?C"
+    r"(?:.*?high\s*=\s*[+\-]?(?P<high>[\d.]+))?"
+    r"(?:.*?crit\s*=\s*[+\-]?(?P<crit>[\d.]+))?",
+    re.IGNORECASE,
+)
+
+def run_temperature_check(terminal, findings):
+    """Run `sensors` and turn each temperature reading into a finding.
+    Read-only, no sudo. If lm-sensors isn't installed, advise the user and
+    return early — no attempt to auto-install."""
+    terminal.append("\nHardware Temperature Check\n" + "─" * 50, T["ACCENT"])
+
+    if not shutil.which("sensors"):
+        msg = ("lm-sensors is not installed. Install it from the Tools panel "
+               "(or: sudo apt install lm-sensors && sudo sensors-detect).")
+        terminal.append_warn(msg)
+        findings.add_finding(
+            "lm-sensors not installed", "HARDWARE", "INFO", msg,
+            "apt-get install lm-sensors"
+        )
+        SESSION.log_scan("Hardware Temperature Check", 0)
+        return 0
+
+    try:
+        r = subprocess.run(
+            ["sensors"], capture_output=True, text=True, timeout=10
+        )
+    except Exception as e:
+        terminal.append_err(f"sensors failed: {e}")
+        return 0
+
+    lines = r.stdout.splitlines()
+    readings = []
+    for line in lines:
+        # Skip adapter / header lines — they don't match the regex anyway but
+        # this keeps the loop efficient.
+        if "°C" not in line and "°c" not in line.lower():
+            continue
+        m = _SENSORS_LINE_RE.search(line)
+        if not m:
+            continue
+        try:
+            cur = float(m.group("cur"))
+        except (TypeError, ValueError):
+            continue
+        high = float(m.group("high")) if m.group("high") else None
+        crit = float(m.group("crit")) if m.group("crit") else None
+        readings.append((m.group("name").strip(), cur, high, crit))
+
+    if not readings:
+        terminal.append_warn(
+            "sensors ran but produced no readings. "
+            "You may need: sudo sensors-detect"
+        )
+        findings.add_finding(
+            "No sensors detected", "HARDWARE", "INFO",
+            "Run `sudo sensors-detect` to register your hardware sensors."
+        )
+        SESSION.log_scan("Hardware Temperature Check", 0)
+        return 0
+
+    total = len(readings)
+    hot = 0
+    for i, (name, cur, high, crit) in enumerate(readings, start=1):
+        prefix = f"[{i}/{total}] {name}"
+        # Threshold decision. If the driver didn't publish thresholds, fall
+        # back to an absolute 80°C rule-of-thumb for CPUs/chipset sensors.
+        if crit is not None and cur >= crit:
+            risk, reason = "HIGH", (
+                f"At or above CRITICAL threshold ({crit:.0f}°C) — "
+                "hardware may throttle, crash, or sustain damage. "
+                "Shut down and investigate cooling."
+            )
+        elif high is not None and cur >= high:
+            risk, reason = "MEDIUM", (
+                f"Above HIGH threshold ({high:.0f}°C) — "
+                "sustained readings here will shorten component life."
+            )
+        elif high is None and crit is None and cur >= 80.0:
+            risk, reason = "MEDIUM", (
+                "Above 80°C with no driver threshold reported — "
+                "treat as hot; check airflow and fan curves."
+            )
+        else:
+            risk, reason = "INFO", f"✔ Normal ({cur:.1f}°C)"
+
+        if risk == "HIGH":
+            terminal.append(f"{prefix} — {cur:.1f}°C  🔥 CRITICAL", T["DANGER"])
+            hot += 1
+        elif risk == "MEDIUM":
+            terminal.append_warn(f"{prefix} — {cur:.1f}°C  ⚠  hot")
+            hot += 1
+        else:
+            terminal.append_ok(f"{prefix} — {cur:.1f}°C")
+
+        findings.add_finding(name, "HARDWARE", risk, f"{cur:.1f}°C — {reason}")
+
+    terminal.append(
+        f"\n{'─'*50}\n{total - hot}/{total} sensors within normal range",
+        T["ACCENT"],
+    )
+    SESSION.log_scan("Hardware Temperature Check", hot)
+    return hot
+
+
+# ── Drive health check (smartmontools) ───────────────────────────────────────
+# Read-only SMART self-assessment. NEVER uses `-t` (self-tests) — those
+# instruct the drive firmware to write and can take hours. We only ever pass
+# `-H` (single-line health summary); callers must preserve that guarantee.
+
+# Kernel device names are already safe for argv, but we validate anyway so a
+# hypothetical lsblk output can't smuggle anything weird into our argv list.
+_DRIVE_NAME_RE = re.compile(r"^[a-zA-Z0-9]+$")
+
+def _list_physical_drives():
+    """Return a list of /dev/... paths for every physical disk lsblk reports.
+    Excludes partitions, LVM volumes, loop devices, and encrypted containers
+    because `-d` + TYPE filter only surfaces top-level disks."""
+    try:
+        r = subprocess.run(
+            ["lsblk", "-d", "-n", "-o", "NAME,TYPE"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        logging.error(f"lsblk failed: {e}")
+        return []
+    drives = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "disk":
+            continue
+        name = parts[0]
+        if not _DRIVE_NAME_RE.match(name):
+            continue
+        drives.append(f"/dev/{name}")
+    return drives
+
+def run_drive_health_check(terminal, findings, parent_widget):
+    """Run `sudo smartctl -H` against every physical drive and surface the
+    pass/fail as findings. The function is deliberately explicit in the
+    terminal about what sudo is being used for — a FAILED SMART result is a
+    "back up now" event, so we never bury the output behind silent sudo."""
+    terminal.append("\nDrive Health Check (SMART)\n" + "─" * 50, T["ACCENT"])
+
+    if not shutil.which("smartctl"):
+        msg = ("smartmontools is not installed. Install it from the Tools "
+               "panel (or: sudo apt install smartmontools).")
+        terminal.append_warn(msg)
+        findings.add_finding(
+            "smartmontools not installed", "HARDWARE", "INFO", msg,
+            "apt-get install smartmontools"
+        )
+        SESSION.log_scan("Drive Health Check", 0)
+        return 0
+
+    drives = _list_physical_drives()
+    if not drives:
+        terminal.append_warn("No physical drives detected by lsblk.")
+        SESSION.log_scan("Drive Health Check", 0)
+        return 0
+
+    # Very obvious terminal notice BEFORE the sudo prompt so nobody is
+    # surprised by what will run.
+    terminal.append(
+        f"\n⚠  SUDO REQUIRED — about to run `smartctl -H` on {len(drives)} "
+        f"drive(s): {', '.join(drives)}\n"
+        "   READ-ONLY: no self-test (-t), no writes, no data modification.\n"
+        "   If a result says FAILED, back up your data immediately.",
+        T["WARN"],
+    )
+
+    pw = prompt_for_sudo_password(
+        parent_widget,
+        f"Drive health check needs sudo to read SMART data from "
+        f"{len(drives)} drive(s). READ-ONLY — nothing is written.",
+        terminal=terminal,
+    )
+    if pw is None:
+        terminal.append_info(
+            "Drive health check cancelled — no sudo password supplied."
+        )
+        SESSION.log_scan("Drive Health Check", 0)
+        return 0
+
+    total  = len(drives)
+    failed = 0
+    unknown = 0
+    for i, dev in enumerate(drives, start=1):
+        prefix = f"[{i}/{total}] {dev}"
+        try:
+            r = subprocess.run(
+                ["sudo", "-S", "smartctl", "-H", dev],
+                input=pw + b"\n",
+                capture_output=True, timeout=15,
+            )
+            out = (r.stdout or b"").decode(errors="replace")
+        except Exception as e:
+            terminal.append_err(f"{prefix} — smartctl failed: {e}")
+            unknown += 1
+            continue
+
+        # `smartctl -H` prints one summary line. Look for PASSED/FAILED
+        # first via the canonical header, then fall back to scanning the
+        # whole output in case of firmware variants.
+        m = re.search(
+            r"SMART.*?self-assessment test result:\s*(\S+)", out, re.I
+        )
+        if m:
+            status = m.group(1).upper()
+        elif re.search(r"\bFAILED\b", out, re.I):
+            status = "FAILED"
+        elif re.search(r"\bPASSED\b", out, re.I):
+            status = "PASSED"
+        else:
+            status = "UNKNOWN"
+
+        if status == "PASSED":
+            terminal.append_ok(f"{prefix} — PASSED")
+            findings.add_finding(
+                dev, "HARDWARE", "INFO",
+                "✔ SMART overall-health self-assessment: PASSED"
+            )
+        elif status == "FAILED":
+            terminal.append(
+                f"{prefix} — 🔴 FAILED — drive is reporting imminent failure. "
+                "BACK UP NOW.",
+                T["DANGER"],
+            )
+            findings.add_finding(
+                dev, "HARDWARE", "HIGH",
+                "SMART self-assessment FAILED — drive is reporting imminent "
+                "failure. Back up your data immediately and replace the drive."
+            )
+            failed += 1
+        else:
+            terminal.append_warn(
+                f"{prefix} — status UNKNOWN (USB bridges and some RAID "
+                "controllers block SMART access)"
+            )
+            findings.add_finding(
+                dev, "HARDWARE", "INFO",
+                "smartctl did not return a recognisable health status. "
+                "Some USB enclosures and RAID controllers hide SMART data — "
+                "this is usually not a fault."
+            )
+            unknown += 1
+
+    terminal.append(
+        f"\n{'─'*50}\n{total - failed - unknown}/{total} drives healthy"
+        + (f"  ({unknown} unknown)" if unknown else ""),
+        T["ACCENT"],
+    )
+    SESSION.log_scan("Drive Health Check", failed)
+    return failed
 
 
 # ── Guided fix wizard ─────────────────────────────────────────────────────────
@@ -4197,7 +4562,7 @@ class SideBar(QWidget, WorkerMixin):
         }
         self._section_required = {
             "scan": {"unused", "network", "services", "os_installed", "user_installed"},
-            "checks": {"quick", "lynis", "wizard"},
+            "checks": {"quick", "lynis", "wizard", "temperature", "drives"},
             "cve": {"cve", "upgrades"} if online_mode else set(),
             "tools": {"tools"},
             "undo": {"undo"},
@@ -4313,6 +4678,12 @@ class SideBar(QWidget, WorkerMixin):
         btn("btn_wizard",
             "Guided step-by-step walkthroughs for common security fixes",
             self._guided_wizard, parent_layout=sec_checks)
+        btn("btn_temperature",
+            "Reads CPU, GPU, and drive temperatures — read-only, no sudo",
+            self._scan_temperature, parent_layout=sec_checks)
+        btn("btn_drives",
+            "SMART self-assessment for every physical drive — sudo, read-only (no self-test)",
+            self._scan_drives, parent_layout=sec_checks)
 
         # ── CVE VULNERABILITY CHECK ───────────────────────────────────────
         sec_cve = section("cve", "sec_cve", "sec_cve_sub")
@@ -4720,13 +5091,20 @@ class SideBar(QWidget, WorkerMixin):
         def _run_quick():
             run_quick_checks(self.terminal, self.findings)
 
+        def _run_temps():
+            run_temperature_check(self.terminal, self.findings)
+
+        # Drive health is intentionally excluded — it needs sudo and RUN
+        # EVERYTHING should never pop a surprise password prompt. Users
+        # trigger it explicitly via the Check Drive Health button.
         self._re_steps = [
-            ("Unused software",       self._do_scan_unused),
-            ("Open network ports",    self._do_scan_network),
-            ("Risky services",        self._do_scan_services),
-            ("Quick security checks", _run_quick),
-            ("CVE vulnerabilities",   lambda: self.cve_panel.scan_cve()),
-            ("Available updates",     lambda: self.cve_panel.scan_upgrades()),
+            ("Unused software",          self._do_scan_unused),
+            ("Open network ports",       self._do_scan_network),
+            ("Risky services",           self._do_scan_services),
+            ("Quick security checks",    _run_quick),
+            ("Hardware temperatures",    _run_temps),
+            ("CVE vulnerabilities",      lambda: self.cve_panel.scan_cve()),
+            ("Available updates",        lambda: self.cve_panel.scan_upgrades()),
         ]
         self._re_step_index = 0
         self._re_on_complete = on_complete
@@ -4776,6 +5154,18 @@ class SideBar(QWidget, WorkerMixin):
         """Open the step-by-step fix wizard dialog."""
         GuidedWizard(self.terminal, self).exec()
         self._mark_section_action_done("checks", "wizard")
+
+    def _scan_temperature(self):
+        """Hardware temperature scan via lm-sensors. Read-only, no sudo."""
+        self._pre_scan(L("btn_temperature"), "checks", "temperature")
+        run_temperature_check(self.terminal, self.findings)
+        self._post_scan_check()
+
+    def _scan_drives(self):
+        """Drive SMART health scan. Needs sudo; stays read-only (no -t)."""
+        self._pre_scan(L("btn_drives"), "checks", "drives")
+        run_drive_health_check(self.terminal, self.findings, self)
+        self._post_scan_check()
 
     # ── CVE checks ────────────────────────────────────────────────────────
     def _scan_cve(self):
