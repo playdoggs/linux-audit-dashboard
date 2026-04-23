@@ -1,93 +1,42 @@
 # Communication Patterns
-<!-- AGENT: Understand signal flow before adding scans or workers. -->
 
-## Shell commands → GUI
-```
-User button click
-  → AuditDashboard._scan_foo()
-    → _pre_scan()         # clears findings + terminal
-    → _do_scan_foo()
-      → CommandWorker(cmd) started via _start_worker()
-        ↓ (background thread)
-        subprocess.run(cmd)
-        ↓
-        output_ready.emit(stdout)  →  terminal.append(text)
-        error_ready.emit(stderr)   →  terminal.append_err(text)
-        finished_ok.emit()         →  _post_scan_check()
-                                   →  parse callback (via output_ready)
-```
+## Command execution flow
+1. UI handler creates `CommandWorker`.
+2. Worker runs command off the GUI thread.
+3. `output_ready`/`error_ready` signals append to terminal.
+4. `finished_ok` triggers post-processing (parsing, UI updates, score updates).
 
-## CVE checks → GUI (HTTP)
-```
-_scan_cve()
-  → HttpWorker(targets) started via _start_worker()
-    ↓ (background thread)
-    urllib.request.urlopen(ubuntu CVE API)  [MAX_ATTEMPTS=2, TIMEOUT=8s, backoff=attempt*1s]
-    ↓
-    result_ready.emit(pkg, (version, data))  →  _handle_cve_result(pkg, data, scan_id)
-    finished_ok.emit()                       →  _finish_cve_scan(scan_id)
-```
-Stale-scan guard: `_cve_active_scan_id` compared in every handler. `cancel_active_scan()` increments serial and calls `worker.cancel()`.
+## CVE flow
+1. `CvePanel.scan_cve()` checks `has_internet()`; skips with a clear message if offline.
+2. Builds installed-package target list.
+3. `HttpWorker` fetches per-package data from Ubuntu CVE API.
+4. `result_ready` updates CVE table, findings, and terminal progress line.
+5. `finished_ok` finalizes summary counters.
 
-## Worker lifecycle (WorkerMixin)
-```
-_start_worker(w):
-  w.finished → _workers.discard(w)   # cleanup tracking set
-  w.finished → w.deleteLater          # Qt memory cleanup
-  _workers.add(w)
-  w.start()
+## Action + undo flow
+1. User clicks REMOVE/DISABLE.
+2. Sudo password prompt + confirmation dialog.
+3. Action runs via `CommandWorker`.
+4. Verification updates findings/risk.
+5. Undo entry appended in-memory + JSONL + live undo panel.
 
-_stop_all_workers():                  # call on widget close
-  for w in _workers: w.quit(); w.wait(500)
-  _workers.clear()
-```
+## RUN EVERYTHING flow
+- `SideBar.run_everything()` queues scan steps.
+- `_re_tick()` polls worker completion and starts next step.
+- Final callback opens `RunEverythingSummaryDialog`.
 
-## Risk score signal chain
-```
-FindingsTable.add_finding()
-  → RISK.add(risk)
-  → score_changed.emit()      ← pyqtSignal on FindingsTable
-    → RiskScorePanel.update_score()
-      → bar.setValue(score)
-      → bar.setStyleSheet(chunk colour)
-      → face_lbl.setPixmap(face for score)
-```
-`score_changed` also emitted by: `_ignore()`, `_remove_finding_and_update_score()`, `clear_findings()`, `end_bulk_update()`.
+## Progress reporting convention
+- Multi-item scans emit `[N/TOTAL] item — status` lines to the terminal on every item (CVE, risky services, quick checks, available updates).
+- Counter resets at scan start; prefix is computed once per iteration.
 
-## Scan action buttons → findings
-```
-_build_action_cell(name, ftype, risk, detail, cmd_remove, cmd_disable)
-  → "?" button  → ExplainDialog(n, ft, r, d).exec()
-  → "✕" button  → _ignore(name)
-                    → RISK.remove_entry(risk)
-                    → table.removeRow(r)
-                    → score_changed.emit()
-  → REMOVE btn  → _act(cmd_remove, name, "remove", risk)
-  → DISABLE btn → _act(cmd_disable, name, "disable", risk)
-```
-Row metadata stored as `Qt.ItemDataRole.UserRole` dict on col 0: `{name, ftype, risk, detail, cmd_remove, cmd_disable}`. Used by `_sort_by_risk()` to rebuild action cells after sort.
+## Offline / connectivity gates
+- `has_internet()` is the single source of truth for connectivity.
+- Hard gate (refuse + advise): CVE scan, tool install.
+- Soft gate (warn + continue): `apt list --upgradable` (local cache is still usable).
+- Always fire any `on_complete` callback even when skipping, so chained flows (RUN EVERYTHING) don't stall.
 
-## Full scan coordination
-```
-_run_full_scan():
-  _pre_scan()           # clear once
-  _do_scan_unused()     # deborphan — async via CommandWorker
-  QTimer.singleShot(1000, _do_scan_network)    # ss -tunlp
-  QTimer.singleShot(2000, _do_scan_services)   # pkg_installed() loop
-```
-Timers prevent simultaneous subprocess launches. Each `_do_scan_*` adds to existing findings (no clear).
+## Shared-panel reset rule
+- `CvePanel` is used by both the CVE button and the Updates button — every entry point MUST call `self.cve_table.setRowCount(0)` before populating, or stale rows leak across scans.
 
-## Undo log write path
-```
-_verify() → success →
-  UNDO_LOG.append(entry)         # in-memory list
-  save_undo_entry(entry)         # append JSON line to ~/.audit-dashboard-undo.log
-  app.undo_panel_ref.add_live_entry(entry)   # live-update UndoPanel if open
-```
-
-## Config persistence
-```
-save_config(section, key, value)  # atomic write via .tmp rename
-load_config()                     # returns ConfigParser — read-only snapshot
-```
-Called from: theme lock, language change, sidebar collapse toggle, profile save.
+## Thread-safety rule
+- All widget mutation must happen in main thread signal handlers.

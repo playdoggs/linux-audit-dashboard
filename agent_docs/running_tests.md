@@ -1,92 +1,41 @@
 # Running Tests
-<!-- AGENT: No automated test suite. Use this checklist after any change. -->
-<!-- Only check items relevant to what you changed. -->
 
-## Quick sanity check (run first, always)
-```bash
-python3 -c "
-import ast, sys
-with open('linux-security-dashboard.py') as f: src = f.read()
-ast.parse(src)
-print('syntax ok —', src.count('\n'), 'lines')
-"
-```
+No automated test suite is currently in the repository.
 
-## Launch check
+## Baseline checks
 ```bash
+python3 -m py_compile linux-security-dashboard.py
 python3 linux-security-dashboard.py
 ```
-Watch for: ImportError, AttributeError at startup, blank window, missing widgets.
 
----
+## Manual regression checklist
 
-## Checklist by area — only run what you touched
+### Security checks
+- Verify `UFW` and `fail2ban` checks fail when `systemctl is-active` returns `inactive` and pass only on exact `active`.
+- Verify `PermitRootLogin` and `PasswordAuthentication` checks ignore commented lines.
 
-### Findings table
-- [ ] Add a finding → appears in table with correct risk badge colour
-- [ ] Sort: HIGH rows at top, then MEDIUM, LOW, INFO
-- [ ] Sort: REMOVE/DISABLE buttons on sorted rows target the correct item (not the pre-sort item)
-- [ ] Ignore (✕): row removed, risk score decreases, item skipped on next scan
-- [ ] Double-click row: ExplainDialog opens with correct name/risk/detail
-- [ ] Search box: filters rows live; clear search restores all
-- [ ] Clear button: table empty, score 0, "all looks well" banner hidden
+### Guided wizard
+- Run SSH hardening wizard step and confirm `sed` commands apply correctly (shlex-parsed).
+- Confirm multi-step fixes run sequentially — each command completes before the next starts.
 
-### Risk score
-- [ ] Score increments when finding added (HIGH=20, MEDIUM=8, LOW=3, INFO=0)
-- [ ] Score decrements when finding removed/ignored/fixed
-- [ ] Face image updates at score thresholds
-- [ ] "All looks well" banner appears only when zero HIGH/MEDIUM findings
+### Actions and undo
+- Run a remove/disable action and confirm undo entry is added.
+- Roll back an action and confirm only the correct row is removed (two entries with the same timestamp must not collide).
 
-### Scans
-- [ ] Unused software scan: orphans appear as LEFTOVER findings
-- [ ] Network scan: open ports appear; RISKY ports get correct risk level
-- [ ] Services scan: known risky services flagged; clean services show INFO
-- [ ] Quick checks: 8 checks run; pass=INFO, fail=MEDIUM; fix text shown
-- [ ] Full scan: all three scans run AND findings from all three are visible (no clear between)
-- [ ] CVE check: packages queried; results appear in CVE tab
-- [ ] Upgrades check: outdated packages listed as OUTDATED/LOW
+### CVE / updates
+- Online: CVE lookup populates rows and findings; terminal shows `[N/TOTAL] pkg — …` per package.
+- Offline: CVE scan shows `⚠ Requires internet — CVE check skipped` in status label and terminal, and RUN EVERYTHING still completes.
+- Switch from CVE scan to "Check for Available Updates" and confirm the CVE table clears (no stale rows).
+- Updates offline: shows cached warning but still runs from local apt cache.
 
-### Sudo / actions
-- [ ] REMOVE: PreActionDialog shown before command runs
-- [ ] REMOVE: on success, row removed and score drops
-- [ ] REMOVE: undo log entry written to `~/.audit-dashboard-undo.log`
-- [ ] No sudo cached: QInputDialog password prompt appears (not terminal prompt)
-- [ ] Cancel password dialog: nothing happens, no command runs
+### Progress lines
+- CVE, risky services, quick checks, and available updates all emit `[N/TOTAL]` prefixed lines in the terminal.
+- Counter starts at 1 on each scan entry — no leftover counts from a previous run.
 
-### Theme
-- [ ] Switch theme: toolbar, sidebar, risk bar, table, terminal ALL update
-- [ ] Switch theme: section header buttons update colour (not stuck on startup theme)
-- [ ] Switch theme: risk bar chunk colour updates
-- [ ] "All looks well" banner (if visible) updates colour on theme switch
-- [ ] Lock theme: relaunching the app uses the locked theme
+### Tool installs
+- With no internet: clicking INSTALL on a tool card shows "Requires Internet" dialog and does not prompt for sudo.
 
-### Workers / threading
-- [ ] Scan that times out: error shown in terminal, UI not permanently stuck on "please wait"
-- [ ] Start scan while another is running: no crash, no duplicate findings (dedup prevents it)
-- [ ] Close window during scan: no crash (WorkerMixin._stop_all_workers)
-
-### Language
-- [ ] Switch language: sidebar buttons, tab labels, section titles update
-- [ ] Missing key: app does not crash (L() falls back to EN)
-
-### Undo panel
-- [ ] After remove action: entry appears live in Undo panel
-- [ ] Relaunch: previous session undo entries loaded from file
-- [ ] Empty state: "No actions taken yet" label visible when no entries
-
----
-
-## Known-good state (v4.2 as committed)
-All items below were confirmed fixed and should not regress:
-- ✅ sudo does not block behind terminal window (uses DEVNULL / sudo -S)
-- ✅ apt list --upgradable does not hang (DEBIAN_FRONTEND=noninteractive)
-- ✅ `_sort_by_risk` rebuilds action cells — buttons target correct items after sort
-- ✅ `_ignore()` decrements risk score
-- ✅ Full scan does not clear previous sub-scan results (_do_scan_* pattern)
-- ✅ `CommandWorker.finished_ok` emitted in `finally:` — UI never stuck on timeout
-- ✅ SSH PasswordAuthentication check uses regex for explicit "no" (no false-pass)
-- ✅ Fail2ban check uses `systemctl is-active` (not just `which`)
-- ✅ `check_update_age` tries `/var/lib/apt/periodic/update-success-stamp` first
-- ✅ `build_palette()` sets all Fusion frame/bevel roles — Light mode has no dark borders
-- ✅ Theme change updates all persistent widgets via objectName + make_style()
-- ✅ Profile re-detected at every startup (not silently reused from config)
+### Theme / language / profile
+- Switch theme and confirm persistent widgets update.
+- Switch language and confirm persisted value.
+- Re-open profile dialog and confirm selected profile affects NORMAL tagging.

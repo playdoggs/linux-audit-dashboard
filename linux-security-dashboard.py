@@ -2,7 +2,7 @@
 """
 Linux Security Dashboard v4.2
 A security health check tool for Linux — plain English, no jargon.
-Built by playdoggy 2026 — my first vibe app 🎮
+Built by playdoggy 2026
 https://github.com/playdoggs/linux-security-dashboard
 
 This app scans your Linux system for security issues, explains them
@@ -22,9 +22,11 @@ import time         # Small retry backoff delays for network calls
 import socket       # Detect timeout/network errors from urllib layers
 import base64       # Decoding the embedded face images
 import html         # Safely escaping text in the HTML report
+import shlex        # Safe splitting/quoting of command strings
 import logging      # Writing errors to a log file without crashing the app
 import configparser # Reading and writing the user's saved preferences
 import shutil       # Checking if external tools (like pkexec) are installed
+import webbrowser   # Auto-open saved HTML reports in the default browser
 from pathlib import Path  # Clean cross-platform file path handling
 
 # ── PyQt6 GUI imports ─────────────────────────────────────────────────────────
@@ -453,7 +455,7 @@ LANGS = {
         "update_two_weeks":"Your system feels neglected 😬",
         "update_month":"Mate. Come on. 😅",
         "update_ancient":"Abandoned like a gym membership in February 💀",
-        "built_by":"Built by playdoggy 2026 — my first vibe app 🎮",
+        "built_by":"Built by playdoggy 2026",
         "sec_scan":"SCAN YOUR SYSTEM",
         "sec_scan_sub":"What software is installed?",
         "sec_checks":"SECURITY CHECKS",
@@ -663,6 +665,114 @@ def check_sudo_cached():
         return result.returncode == 0
     except Exception:
         return False
+
+def has_internet(timeout=2.0):
+    """Best-effort connectivity probe for features that need the internet
+    (CVE lookups, package installs). Tries a TCP connect to 1.1.1.1:443 — no
+    DNS required, no HTTP round-trip, ~100ms on a healthy connection. Returns
+    False on any failure so callers can show a clear 'requires internet'
+    message instead of waiting for urllib to time out."""
+    try:
+        with socket.create_connection(("1.1.1.1", 443), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+def get_system_info():
+    """Return a dict of basic system info for reports and the terminal header.
+    Everything is best-effort — any failed probe falls back to 'Unknown' so
+    the report never breaks over a missing tool."""
+    def _run(cmd, timeout=3):
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    info = {
+        "hostname": _run(["hostname"]) or "Unknown",
+        "kernel":   _run(["uname", "-r"]) or "Unknown",
+        "arch":     _run(["uname", "-m"]) or "Unknown",
+        "os":       "Unknown",
+        "cpu":      "Unknown",
+        "ram":      "Unknown",
+        "uptime":   "Unknown",
+    }
+
+    # /etc/os-release gives us the friendly OS name (e.g. "Ubuntu 24.04 LTS")
+    try:
+        with open("/etc/os-release") as f:
+            os_data = {}
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    os_data[k] = v.strip('"')
+            info["os"] = os_data.get("PRETTY_NAME") or os_data.get("NAME", "Unknown")
+    except Exception:
+        pass
+
+    # CPU model — first "model name" entry in /proc/cpuinfo
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    info["cpu"] = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+
+    # Total RAM in GB — /proc/meminfo reports kB
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    info["ram"] = f"{kb / 1024 / 1024:.1f} GB"
+                    break
+    except Exception:
+        pass
+
+    # Uptime in a human-friendly form
+    try:
+        with open("/proc/uptime") as f:
+            secs = int(float(f.read().split()[0]))
+        days, rem = divmod(secs, 86400)
+        hrs, rem  = divmod(rem, 3600)
+        mins      = rem // 60
+        if days:
+            info["uptime"] = f"{days}d {hrs}h {mins}m"
+        elif hrs:
+            info["uptime"] = f"{hrs}h {mins}m"
+        else:
+            info["uptime"] = f"{mins}m"
+    except Exception:
+        pass
+
+    return info
+
+def prompt_for_sudo_password(parent, reason_text, terminal=None, force_prompt=False):
+    """Prompt the user for their sudo password via a GUI dialog.
+
+    Returns the password as bytes if the user entered one, b"" if sudo
+    credentials are already cached (and force_prompt is False), or None
+    if the user cancelled. Pass force_prompt=True to always show the
+    dialog — useful for long-running actions (like Lynis) where the
+    cached credentials may expire mid-run."""
+    if not force_prompt and check_sudo_cached():
+        return b""
+    pw, ok = QInputDialog.getText(
+        parent,
+        "Administrator Password Required",
+        f"{reason_text}\n\nYour password is used once and never stored.",
+        QLineEdit.EchoMode.Password,
+    )
+    if not ok or not pw:
+        if terminal is not None:
+            terminal.append_err("Action cancelled — sudo password not provided.")
+        return None
+    return pw.encode()
 
 # ── Rollback risk database ────────────────────────────────────────────────────
 # For each action type, explains what rollback does, the risk that returns,
@@ -1104,10 +1214,21 @@ class CommandWorker(QThread):
     def run(self):
         """This runs in a background thread — never touch the GUI from here."""
         try:
+            # Force DEBIAN_FRONTEND=noninteractive for every sudo command so
+            # apt/dpkg never try to open a TTY for debconf prompts — we have
+            # no TTY available (stdin is the sudo password pipe or DEVNULL).
+            # We inject via the `env` command rather than sudo -E because
+            # sudoers' env_reset policy would otherwise strip these vars
+            # before the child process sees them.
+            noninteractive_prefix = [
+                "env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "DEBIAN_PRIORITY=critical",
+            ]
+
             if self.sudo and self.password:
                 # Pass password via stdin with sudo -S.
-                # input= sets stdin to PIPE and writes the bytes then closes it.
-                full = ["sudo", "-S"] + self.cmd
+                full = ["sudo", "-S"] + noninteractive_prefix + self.cmd
                 p = subprocess.run(
                     full,
                     input=self.password + b"\n",
@@ -1120,7 +1241,10 @@ class CommandWorker(QThread):
                 # for a password on the parent terminal. If credentials are not
                 # cached, sudo will fail immediately with a clear error message
                 # rather than hanging silently in the background.
-                full = (["sudo"] + self.cmd) if self.sudo else self.cmd
+                if self.sudo:
+                    full = ["sudo"] + noninteractive_prefix + self.cmd
+                else:
+                    full = self.cmd
                 p = subprocess.run(
                     full,
                     stdin=subprocess.DEVNULL,
@@ -2139,22 +2263,13 @@ class FindingsTable(QWidget, WorkerMixin):
         """Run an action (remove/disable) after showing the confirmation dialog.
         Prompts for sudo password via a GUI dialog if credentials are not cached."""
 
-        # Determine if we need a password
-        sudo_password = None
-        if not check_sudo_cached():
-            pw, ok = QInputDialog.getText(
-                self,
-                "Administrator Password Required",
-                "This action requires your sudo (administrator) password.\n"
-                "Your password is used once and never stored.",
-                QLineEdit.EchoMode.Password,
-            )
-            if not ok or not pw:
-                self.terminal.append_err(
-                    "Action cancelled — sudo password not provided."
-                )
-                return
-            sudo_password = pw.encode()
+        sudo_password = prompt_for_sudo_password(
+            self,
+            "This action requires your sudo (administrator) password.",
+            terminal=self.terminal,
+        )
+        if sudo_password is None:
+            return
 
         # Show the confirmation dialog
         dlg = PreActionDialog(action_type, name, cmd, self)
@@ -2369,7 +2484,7 @@ def run_quick_checks(terminal, findings):
         (
             "SSH PermitRootLogin disabled",
             ["grep", "-i", "PermitRootLogin", "/etc/ssh/sshd_config"],
-            lambda o: "no" in o.lower() or "prohibit" in o.lower(),
+            lambda o: bool(re.search(r"(?im)^\s*PermitRootLogin\s+(no|prohibit-password)\b", o)),
             "Edit /etc/ssh/sshd_config → PermitRootLogin no  then: sudo systemctl restart sshd",
             "Stops attackers from logging in directly as the all-powerful root account over SSH."
         ),
@@ -2383,14 +2498,14 @@ def run_quick_checks(terminal, findings):
         (
             "UFW firewall is active",
             ["systemctl", "is-active", "ufw"],
-            lambda o: "active" in o.lower(),
+            lambda o: o.strip() == "active",
             "sudo ufw default deny incoming && sudo ufw allow ssh && sudo ufw enable",
             "Your firewall is off. Everything on your machine is reachable from your network."
         ),
         (
             "Fail2ban is installed and running",
             ["systemctl", "is-active", "fail2ban"],
-            lambda o: "active" in o.lower(),
+            lambda o: o.strip() == "active",
             "sudo apt install fail2ban  — works automatically after install",
             "Blocks IPs that repeatedly fail login attempts. Stops brute-force attacks cold."
         ),
@@ -2424,14 +2539,16 @@ def run_quick_checks(terminal, findings):
         ),
     ]
 
+    total = len(CHECKS)
     passed = 0
-    for desc, cmd, pass_fn, fix, why in CHECKS:
+    for i, (desc, cmd, pass_fn, fix, why) in enumerate(CHECKS, start=1):
+        prefix = f"[{i}/{total}]"
         try:
             r  = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             ok = pass_fn(r.stdout + r.stderr)
             if ok:
                 # Pass — show in terminal AND add green INFO finding
-                terminal.append_ok(desc)
+                terminal.append_ok(f"{prefix} {desc}")
                 findings.add_finding(
                     desc, "HARDENING", "INFO",
                     "✔ This check passed — no action needed."
@@ -2439,16 +2556,16 @@ def run_quick_checks(terminal, findings):
                 passed += 1
             else:
                 # Fail — show in terminal AND add MEDIUM finding
-                terminal.append(f"  ✖  {desc}", T["DANGER"])
+                terminal.append(f"{prefix}  ✖  {desc}", T["DANGER"])
                 terminal.append(f"     Why: {why}", T["WARN"])
                 terminal.append(f"     Fix: {fix}", T["TEXT_DIM"])
                 findings.add_finding(desc, "HARDENING", "MEDIUM", why)
         except subprocess.TimeoutExpired:
-            terminal.append_warn(f"{desc} — check timed out")
+            terminal.append_warn(f"{prefix} {desc} — check timed out")
         except FileNotFoundError:
-            terminal.append_warn(f"{desc} — command not available on this system")
+            terminal.append_warn(f"{prefix} {desc} — command not available on this system")
         except Exception as e:
-            terminal.append_warn(f"{desc} — could not check: {e}")
+            terminal.append_warn(f"{prefix} {desc} — could not check: {e}")
             logging.error(f"Quick check '{desc}' failed: {e}")
 
     terminal.append(
@@ -2471,6 +2588,9 @@ class GuidedWizard(QDialog, WorkerMixin):
         self.setMinimumSize(660, 540)
         self.terminal = terminal
         self._cmds    = []  # Commands for the currently selected fix
+        self._fix_running = False
+        self._pending_fix_cmds = []
+        self._fix_password = None
 
         layout = QVBoxLayout(self)
         hdr = QLabel("🔧  GUIDED FIX WIZARD")
@@ -2640,7 +2760,7 @@ class GuidedWizard(QDialog, WorkerMixin):
 
     def _run_fix(self):
         """Run all the commands for the selected fix after confirmation."""
-        if not self._cmds:
+        if not self._cmds or self._fix_running:
             return
         if QMessageBox.question(
             self, "Run Fix?",
@@ -2648,24 +2768,62 @@ class GuidedWizard(QDialog, WorkerMixin):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) != QMessageBox.StandardButton.Yes:
             return
+
+        sudo_password = prompt_for_sudo_password(
+            self,
+            f"Running this fix requires your sudo (administrator) password.\n"
+            f"{len(self._cmds)} command(s) will run with sudo.",
+            terminal=self.terminal,
+        )
+        if sudo_password is None:
+            return
+
+        parsed_cmds = []
         for cmd in self._cmds:
             # cmd may be a pre-split list (for commands with shell syntax)
             # or a plain string (split on whitespace for simple commands)
             if isinstance(cmd, list):
-                cmd_list = cmd
-                cmd_str  = " ".join(cmd)
+                cmd_list = list(cmd)
+                cmd_str  = " ".join(shlex.quote(p) for p in cmd_list)
             else:
-                cmd_list = cmd.split()
-                cmd_str  = cmd
-            self.terminal.append_cmd(f"sudo {cmd_str}")
-            w = CommandWorker(cmd_list, sudo=True, timeout=120)
-            w.output_ready.connect(lambda t: self.terminal.append(t, T["OK"]))
-            w.error_ready.connect(self.terminal.append_err)
-            self._start_worker(w)
-        QMessageBox.information(
-            self, "Running",
-            "Commands sent to the terminal. Check the terminal panel for results."
+                try:
+                    cmd_list = shlex.split(cmd)
+                except ValueError as e:
+                    QMessageBox.warning(
+                        self, "Invalid Command",
+                        f"Could not parse command:\n{cmd}\n\nError: {e}"
+                    )
+                    return
+                cmd_str = cmd
+            parsed_cmds.append((cmd_list, cmd_str))
+
+        self._fix_running = True
+        self._pending_fix_cmds = parsed_cmds
+        self._fix_password = sudo_password
+        self.run_btn.setEnabled(False)
+        self._run_next_fix_cmd()
+
+    def _run_next_fix_cmd(self):
+        """Run the next guided-fix command sequentially."""
+        if not self._pending_fix_cmds:
+            self._fix_running = False
+            self._fix_password = None
+            self.run_btn.setEnabled(True)
+            QMessageBox.information(
+                self, "Completed",
+                "All fix commands finished. Check the terminal panel for results."
+            )
+            return
+
+        cmd_list, cmd_str = self._pending_fix_cmds.pop(0)
+        self.terminal.append_cmd(f"sudo {cmd_str}")
+        w = CommandWorker(
+            cmd_list, sudo=True, timeout=120, password=self._fix_password
         )
+        w.output_ready.connect(lambda t: self.terminal.append(t, T["OK"]))
+        w.error_ready.connect(self.terminal.append_err)
+        w.finished_ok.connect(self._run_next_fix_cmd)
+        self._start_worker(w)
 
     # ── Fix definitions — steps (shown to user) and commands (what runs) ──
     def _fix_ufw(self):
@@ -2956,23 +3114,14 @@ class LynisPanel(QWidget, WorkerMixin):
         self.output.ensureCursorVisible()
 
     def _get_sudo_password(self, reason_text, force_prompt=False):
-        """
-        Return sudo password bytes if needed, b'' if cached, or None if cancelled.
-        If force_prompt=True, always show the password dialog in the foreground.
-        """
-        if not force_prompt and check_sudo_cached():
-            return b""
-        pw, ok = QInputDialog.getText(
-            self,
-            "Administrator Password Required",
-            f"{reason_text}\n\nYour password is used once and never stored.",
-            QLineEdit.EchoMode.Password,
+        """Prompt for the sudo password and mirror the status bar on cancel.
+        Delegates to the shared prompt_for_sudo_password helper."""
+        pw = prompt_for_sudo_password(
+            self, reason_text, terminal=self.terminal, force_prompt=force_prompt
         )
-        if not ok or not pw:
+        if pw is None:
             self.status.setText("Action cancelled.")
-            self.terminal.append_err("Action cancelled — sudo password not provided.")
-            return None
-        return pw.encode()
+        return pw
 
     def run_lynis(self, on_complete=None):
         """Check if Lynis is installed, offer to install it, then run the audit."""
@@ -3024,9 +3173,42 @@ class LynisPanel(QWidget, WorkerMixin):
         w.output_ready.connect(self._parse_lynis_output)
         w.error_ready.connect(lambda t: self._lappend(t, T["DANGER"]))
         w.finished_ok.connect(lambda: self.status.setText("Lynis audit complete — see results above."))
+        # Also clear the "Please wait" indicator in the shared terminal so the
+        # user sees a completion line next to the running line.
+        w.finished_ok.connect(
+            lambda: self.terminal.append_ok("Lynis Full Audit complete.")
+        )
         if on_complete:
             w.finished_ok.connect(on_complete)
         self._start_worker(w)
+
+    def _read_lynis_log(self):
+        """Return the contents of /var/log/lynis.log as a string, or None if
+        unreadable. Tries a direct read first; falls back to `sudo -n cat`
+        since sudo credentials are still cached from the audit we just ran."""
+        try:
+            with open("/var/log/lynis.log") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            pass
+        except Exception as e:
+            logging.error(f"Lynis log direct read error: {e}")
+            return None
+
+        # Fall back to sudo -n (non-interactive). The Lynis audit just finished,
+        # so the sudo timestamp is fresh — no password prompt needed.
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "cat", "/var/log/lynis.log"],
+                capture_output=True, timeout=5
+            )
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", errors="replace")
+        except Exception as e:
+            logging.error(f"Lynis log sudo read error: {e}")
+        return None
 
     def _parse_lynis_output(self, text):
         """Parse Lynis output and display results. Try the structured log file
@@ -3035,9 +3217,8 @@ class LynisPanel(QWidget, WorkerMixin):
         text = strip_ansi(text)
 
         # Try reading the structured Lynis log file first
-        try:
-            with open("/var/log/lynis.log") as f:
-                log = f.read()
+        log = self._read_lynis_log()
+        if log is not None:
             warns = []; suggs = []; idx = None
             for line in log.splitlines():
                 if "|WARNING|" in line:
@@ -3078,19 +3259,17 @@ class LynisPanel(QWidget, WorkerMixin):
             SESSION.log_scan("Lynis Full Audit", len(warns))
             return
 
-        except FileNotFoundError:
-            pass  # Log file not available — fall back to parsing raw output
-        except PermissionError:
-            # Common when app is not run as root — not an app fault.
-            self._lappend(
-                "  ℹ  Could not read /var/log/lynis.log (permission denied). "
-                "Parsing live output instead.",
-                T["TEXT_DIM"]
-            )
-        except Exception as e:
-            logging.error(f"Lynis log parse error: {e}")
+        # Log file unreadable — tell the user once before falling back.
+        self._lappend(
+            "  ℹ  Could not read /var/log/lynis.log. Parsing live output instead.",
+            T["TEXT_DIM"]
+        )
 
-        # Fallback: parse the raw output text
+        # Fallback: parse the raw output text.
+        # Filter out log lines emitted by subprocesses Lynis invokes (e.g.
+        # fail2ban, auditd) — they match \bwarning\b but aren't Lynis findings.
+        # Noise looks like "<ISO-timestamp> <module>.<sub>[pid]: WARNING ...".
+        noise_re = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
         warn_count = 0
         sugg_count = 0
         summary_warns = None
@@ -3099,6 +3278,8 @@ class LynisPanel(QWidget, WorkerMixin):
             clean = strip_ansi(line).strip()
             if not clean:
                 continue
+            if noise_re.match(clean):
+                continue  # Subprocess log line, not a Lynis finding
             mw = re.search(r"\bWarnings?\b\s*[:=]\s*(\d+)", clean, re.I)
             if mw:
                 summary_warns = int(mw.group(1))
@@ -3224,6 +3405,21 @@ class CvePanel(QWidget, WorkerMixin):
         scan_id = self._cve_scan_serial
         self._cve_active_scan_id = scan_id
         self.cve_table.setRowCount(0)
+
+        # CVE lookups hit ubuntu.com/security/cves.json — short-circuit if
+        # we're offline so the user gets a clear message instead of dozens
+        # of urllib timeouts piling up in the terminal.
+        if not has_internet():
+            msg = "⚠  Requires internet — no connection detected. CVE check skipped."
+            self.status.setText(msg)
+            self.terminal.append_warn(msg)
+            if on_complete:
+                try:
+                    on_complete()
+                finally:
+                    self._scan_cve_done_cb = None
+            return
+
         self.status.setText("Finding installed packages to check...")
         self.terminal.append_cmd("# CVE check — querying Ubuntu security database")
 
@@ -3242,6 +3438,7 @@ class CvePanel(QWidget, WorkerMixin):
         self._cve_timeout = 0
         self._cve_network = 0
         self._cve_error = 0
+        self._cve_done = 0
 
         self.status.setText(
             f"Querying CVE database for {len(targets)} packages — please wait..."
@@ -3260,9 +3457,11 @@ class CvePanel(QWidget, WorkerMixin):
         """Process one package's CVE results and add to the table."""
         if scan_id != self._cve_active_scan_id:
             return
+        self._cve_done += 1
+        prefix = f"[{self._cve_done}/{self._cve_total}] {pkg}"
         if data is None:
             self._cve_error += 1
-            self.terminal.append_info(f"Could not check: {pkg}")
+            self.terminal.append_info(f"{prefix} — could not check")
             return
 
         version, cve_data = data
@@ -3270,13 +3469,13 @@ class CvePanel(QWidget, WorkerMixin):
             err = cve_data.get("_error")
             if err == "timeout":
                 self._cve_timeout += 1
-                self.terminal.append_info(f"Could not check: {pkg} (network timeout)")
+                self.terminal.append_info(f"{prefix} — could not check (network timeout)")
             elif err == "network":
                 self._cve_network += 1
-                self.terminal.append_info(f"Could not check: {pkg} (network unavailable)")
+                self.terminal.append_info(f"{prefix} — could not check (network unavailable)")
             else:
                 self._cve_error += 1
-                self.terminal.append_info(f"Could not check: {pkg} (request failed)")
+                self.terminal.append_info(f"{prefix} — could not check (request failed)")
             return
 
         self._cve_ok += 1
@@ -3323,8 +3522,11 @@ class CvePanel(QWidget, WorkerMixin):
                 f"apt-get upgrade {pkg}"
             )
             self.terminal.append_warn(
-                f"{pkg} ({version}): {count} CVEs — highest: {highest.upper()}"
+                f"{prefix} ({version}) — {count} CVEs, highest: {highest.upper()}"
             )
+        else:
+            summary = "no known CVEs" if count == 0 else f"{count} CVEs, highest: {highest.upper()}"
+            self.terminal.append_info(f"{prefix} ({version}) — {summary}")
 
     def _finish_cve_scan(self, scan_id):
         """Show clearer completion summary including failure reasons."""
@@ -3358,6 +3560,20 @@ class CvePanel(QWidget, WorkerMixin):
         """Check which packages have newer versions available.
         Uses DEBIAN_FRONTEND=noninteractive so apt never waits for user input."""
         self._scan_upgrades_done_cb = on_complete
+        # Clear any stale rows from a previous CVE scan — this panel is shared
+        # between the "CVE" and "available updates" buttons, so the table must
+        # reset every time the user switches.
+        self.cve_table.setRowCount(0)
+
+        # `apt list --upgradable` reads the local cache, so it runs offline —
+        # but the cache only reflects what the last `apt update` pulled. Warn
+        # so users know their result may be stale.
+        if not has_internet():
+            warn = ("⚠  No internet detected — showing cached results only. "
+                    "Run 'sudo apt update' online for the latest.")
+            self.status.setText(warn)
+            self.terminal.append_warn(warn)
+
         self.terminal.append_cmd("apt list --upgradable")
         self.status.setText("Checking for available updates...")
 
@@ -3389,24 +3605,45 @@ class CvePanel(QWidget, WorkerMixin):
             l for l in text.splitlines()
             if "/" in l and not l.startswith("Listing")
         ]
-        self.terminal.append_info(f"{len(lines)} packages have updates available.")
-        for line in lines[:30]:
+        total = len(lines)
+        if total == 0:
+            self.terminal.append_ok("No updates available — you're up to date.")
+            SESSION.log_scan("Check for Updates", 0)
+            return
+
+        self.terminal.append_info(f"{total} packages have updates available.")
+        shown = min(total, 30)
+        for i, line in enumerate(lines[:shown], start=1):
             pkg = line.split("/")[0].strip()
-            if valid_pkg(pkg):
-                self.findings.add_finding(
-                    pkg, "OUTDATED", "LOW",
-                    "A newer version is available — consider updating",
-                    f"apt-get upgrade {pkg}"
-                )
-        if len(lines) > 30:
-            self.terminal.append_info(f"...and {len(lines)-30} more (showing first 30)")
-        SESSION.log_scan("Check for Updates", len(lines))
+            if not valid_pkg(pkg):
+                continue
+            # Pull the new version (second whitespace-separated token) to make
+            # the progress line useful — users can see what's changing.
+            parts = line.split()
+            new_ver = parts[1] if len(parts) > 1 else "?"
+            self.findings.add_finding(
+                pkg, "OUTDATED", "LOW",
+                "A newer version is available — consider updating",
+                f"apt-get upgrade {pkg}"
+            )
+            self.terminal.append_info(f"[{i}/{shown}] {pkg} → {new_ver}")
+        if total > shown:
+            self.terminal.append_info(f"...and {total - shown} more (showing first {shown})")
+        SESSION.log_scan("Check for Updates", total)
 
 
 # ── Recommended tools panel ───────────────────────────────────────────────────
 class ToolCard(QFrame):
     """A single card showing one recommended security/monitoring tool.
     Shows: name, category, description, install status, and action buttons."""
+
+    # Widths chosen so the longest label in each column fits without clipping
+    # at the default BASE_FS of 13px: "Monitoring" (category),
+    # "✗ Not installed" (status), "HOW TO USE"/"REINSTALL" (buttons).
+    CAT_WIDTH    = 96
+    STATUS_WIDTH = 120
+    BTN_WIDTH    = 115
+    BTN_HEIGHT   = 28
 
     def __init__(self, tool_data, terminal):
         super().__init__()
@@ -3432,17 +3669,18 @@ class ToolCard(QFrame):
             "Storage":    T["WARN"],
         }
         cat_lbl = QLabel(tool_data["cat"])
-        cat_lbl.setFixedWidth(75)
+        cat_lbl.setFixedWidth(self.CAT_WIDTH)
         cat_lbl.setStyleSheet(
             f"color:{cat_colours.get(tool_data['cat'], T['TEXT_DIM'])};"
             f"font-size:{fs(-2)}px;font-weight:bold;"
         )
-        layout.addWidget(cat_lbl)
+        layout.addWidget(cat_lbl, 0, Qt.AlignmentFlag.AlignTop)
 
         # Name and description
         info_col = QVBoxLayout()
         info_col.setSpacing(2)
         name_lbl = QLabel(tool_data["name"])
+        name_lbl.setWordWrap(True)
         name_lbl.setStyleSheet(
             f"color:{T['TEXT_MAIN']};font-weight:bold;font-size:{fs()}px;"
         )
@@ -3457,31 +3695,32 @@ class ToolCard(QFrame):
 
         # Install status indicator
         self.status_lbl = QLabel("Checking...")
-        self.status_lbl.setFixedWidth(90)
+        self.status_lbl.setFixedWidth(self.STATUS_WIDTH)
+        self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet(f"font-size:{fs(-2)}px;")
-        layout.addWidget(self.status_lbl)
+        layout.addWidget(self.status_lbl, 0, Qt.AlignmentFlag.AlignTop)
 
         # Action buttons
         btn_col = QVBoxLayout()
-        btn_col.setSpacing(3)
+        btn_col.setSpacing(4)
 
         self.install_btn = QPushButton("INSTALL")
         self.install_btn.setObjectName("ok")
-        self.install_btn.setFixedSize(90, 26)
+        self.install_btn.setFixedSize(self.BTN_WIDTH, self.BTN_HEIGHT)
         self.install_btn.setToolTip(f"Install {tool_data['name']} using {PKG_MGR}")
         self.install_btn.clicked.connect(self._install)
         btn_col.addWidget(self.install_btn)
 
         how_btn = QPushButton("HOW TO USE")
         how_btn.setObjectName("neutral")
-        how_btn.setFixedSize(90, 26)
+        how_btn.setFixedSize(self.BTN_WIDTH, self.BTN_HEIGHT)
         how_btn.setToolTip(f"Show setup and usage guide for {tool_data['name']}")
         how_btn.clicked.connect(self._show_how_to_use)
         btn_col.addWidget(how_btn)
 
         run_btn = QPushButton("RUN NOW")
         run_btn.setObjectName("neutral")
-        run_btn.setFixedSize(90, 26)
+        run_btn.setFixedSize(self.BTN_WIDTH, self.BTN_HEIGHT)
         run_btn.setToolTip(f"Run {tool_data['name']} now in the terminal")
         run_btn.clicked.connect(self._run_tool)
         btn_col.addWidget(run_btn)
@@ -3506,6 +3745,17 @@ class ToolCard(QFrame):
 
     def _install(self):
         """Install the tool with confirmation."""
+        if not has_internet():
+            QMessageBox.warning(
+                self, "Requires Internet",
+                f"Installing '{self.tool['name']}' needs an internet connection "
+                "to download the package, and none was detected.\n\n"
+                "Connect to the internet and try again."
+            )
+            self.terminal.append_warn(
+                f"⚠  Install skipped — requires internet (no connection detected): {self.tool['name']}"
+            )
+            return
         cmd = pkg_install(self.tool["name"])
         if QMessageBox.question(
             self, f"Install {self.tool['name']}?",
@@ -3514,8 +3764,17 @@ class ToolCard(QFrame):
         ) != QMessageBox.StandardButton.Yes:
             return
 
+        sudo_password = prompt_for_sudo_password(
+            self,
+            f"Installing '{self.tool['name']}' requires your sudo "
+            f"(administrator) password.",
+            terminal=self.terminal,
+        )
+        if sudo_password is None:
+            return
+
         self.terminal.append_cmd(f"sudo {' '.join(cmd)}")
-        w = CommandWorker(cmd, sudo=True, timeout=180)
+        w = CommandWorker(cmd, sudo=True, timeout=180, password=sudo_password)
         w.output_ready.connect(lambda t: self.terminal.append(t, T["OK"]))
         w.error_ready.connect(self.terminal.append_err)
         w.finished_ok.connect(self._check_installed)
@@ -3563,10 +3822,24 @@ class ToolCard(QFrame):
         """Run the tool in the terminal panel."""
         cmd_parts = self.tool["run"].split()
         use_sudo  = self.tool.get("safe_run", False)
+
+        sudo_password = None
+        if use_sudo:
+            sudo_password = prompt_for_sudo_password(
+                self,
+                f"Running '{self.tool['name']}' requires your sudo "
+                f"(administrator) password.",
+                terminal=self.terminal,
+            )
+            if sudo_password is None:
+                return
+
         self.terminal.append_cmd(
             ("sudo " if use_sudo else "") + self.tool["run"]
         )
-        w = CommandWorker(cmd_parts, sudo=use_sudo, timeout=30)
+        w = CommandWorker(
+            cmd_parts, sudo=use_sudo, timeout=30, password=sudo_password
+        )
         w.output_ready.connect(lambda t: self.terminal.append(t))
         w.error_ready.connect(self.terminal.append_err)
         w.finished.connect(lambda: self._workers.discard(w))
@@ -3844,9 +4117,18 @@ class UndoPanel(QWidget, WorkerMixin):
         ) != QMessageBox.StandardButton.Yes:
             return
 
+        sudo_password = prompt_for_sudo_password(
+            self,
+            "Rolling back this action requires your sudo "
+            "(administrator) password.",
+            terminal=self.terminal,
+        )
+        if sudo_password is None:
+            return
+
         self.terminal.append_cmd(entry["undo_cmd"])
         cmd = entry["undo_cmd"].replace("sudo ", "").split()
-        w = CommandWorker(cmd, sudo=True)
+        w = CommandWorker(cmd, sudo=True, password=sudo_password)
         w.output_ready.connect(lambda t: self.terminal.append(t, T["OK"]))
         w.error_ready.connect(self.terminal.append_err)
         w.finished_ok.connect(
@@ -3857,12 +4139,31 @@ class UndoPanel(QWidget, WorkerMixin):
     def _remove_undo_entry_after_rollback(self, entry):
         """Remove the row from the undo table after a successful rollback."""
         self.terminal.append_ok(f"Rollback complete: {entry['action']}")
+
+        # Keep in-memory list in sync with the table.
+        for i in range(len(UNDO_LOG) - 1, -1, -1):
+            e = UNDO_LOG[i]
+            if (
+                e.get("time") == entry.get("time")
+                and e.get("action") == entry.get("action")
+                and e.get("cmd") == entry.get("cmd")
+                and e.get("undo_cmd") == entry.get("undo_cmd")
+            ):
+                UNDO_LOG.pop(i)
+                break
+
         # Find and remove the matching row
         for r in range(self.table.rowCount() - 1, -1, -1):
             item = self.table.item(r, 0)
             if item:
                 stored = item.data(Qt.ItemDataRole.UserRole)
-                if stored and stored.get("time") == entry.get("time"):
+                if (
+                    stored
+                    and stored.get("time") == entry.get("time")
+                    and stored.get("action") == entry.get("action")
+                    and stored.get("cmd") == entry.get("cmd")
+                    and stored.get("undo_cmd") == entry.get("undo_cmd")
+                ):
                     self.table.removeRow(r)
                     break
 
@@ -4282,12 +4583,14 @@ class SideBar(QWidget, WorkerMixin):
             ("rpcbind",      "SERVICE","MEDIUM","NFS portmapper — only needed if you are actively sharing files over NFS",                    None,                     "systemctl disable --now rpcbind"),
         ]
         self.terminal.append_cmd("# Checking for risky services...")
+        total = len(RISKY_SVCS)
         found = 0
-        for item in RISKY_SVCS:
+        for i, item in enumerate(RISKY_SVCS, start=1):
             name = item[0]
+            prefix = f"[{i}/{total}] {name}"
             if pkg_installed(name):
                 self.findings.add_finding(*item)
-                self.terminal.append_warn(f"FOUND: {name} — {item[3]}")
+                self.terminal.append_warn(f"{prefix} — FOUND: {item[3]}")
                 found += 1
             else:
                 # Show "not found" in findings as green INFO so user knows it was checked
@@ -4295,7 +4598,7 @@ class SideBar(QWidget, WorkerMixin):
                     name, "SERVICE", "INFO",
                     f"✔ Not installed — no action needed"
                 )
-                self.terminal.append_ok(f"{name} — not installed")
+                self.terminal.append_ok(f"{prefix} — not installed")
 
         SESSION.log_scan(L("btn_services"), found)
         self._post_scan_check()
@@ -4401,6 +4704,61 @@ class SideBar(QWidget, WorkerMixin):
         # Stagger the scans slightly so they don't all start simultaneously
         QTimer.singleShot(1000,  self._do_scan_network)
         QTimer.singleShot(2000,  self._do_scan_services)
+
+    # ── Scan: RUN EVERYTHING — assessment sequence ────────────────────────
+    def run_everything(self, on_complete=None):
+        """Run every non-sudo scan in sequence. Lynis is skipped because it
+        needs sudo + a long runtime; users run it separately.
+
+        ``on_complete`` fires once after the final step finishes and is used
+        by AuditDashboard to open the summary assessment dialog."""
+        self._pre_scan("RUN EVERYTHING — Full Assessment", "scan", "fullscan")
+        self.terminal.append_info(
+            "Running all assessment scans in sequence. This may take 30–60 seconds."
+        )
+
+        def _run_quick():
+            run_quick_checks(self.terminal, self.findings)
+
+        self._re_steps = [
+            ("Unused software",       self._do_scan_unused),
+            ("Open network ports",    self._do_scan_network),
+            ("Risky services",        self._do_scan_services),
+            ("Quick security checks", _run_quick),
+            ("CVE vulnerabilities",   lambda: self.cve_panel.scan_cve()),
+            ("Available updates",     lambda: self.cve_panel.scan_upgrades()),
+        ]
+        self._re_step_index = 0
+        self._re_on_complete = on_complete
+        self._re_tick()
+
+    def _re_tick(self):
+        """Drive the RUN EVERYTHING queue: wait for any running worker to
+        finish, run the next step, and once the queue is empty fire the
+        on_complete callback. Polled every 400ms via QTimer."""
+        if getattr(self, "_re_step_index", 0) >= len(getattr(self, "_re_steps", [])):
+            self.terminal.append_ok("RUN EVERYTHING complete.")
+            self._post_scan_check()
+            cb = getattr(self, "_re_on_complete", None)
+            if cb:
+                cb()
+            return
+
+        if self._any_running:
+            QTimer.singleShot(400, self._re_tick)
+            return
+
+        name, fn = self._re_steps[self._re_step_index]
+        self.terminal.append_info(
+            f"▶  Step {self._re_step_index + 1}/{len(self._re_steps)}: {name}"
+        )
+        self._re_step_index += 1
+        try:
+            fn()
+        except Exception as e:
+            self.terminal.append_err(f"Step '{name}' failed: {e}")
+        # Give the worker a moment to register on _workers before re-polling
+        QTimer.singleShot(500, self._re_tick)
 
     # ── Security checks ───────────────────────────────────────────────────
     def _quick_checks(self):
@@ -4758,75 +5116,406 @@ class SessionSummaryDialog(QDialog):
         layout.addWidget(btns)
 
 
+# ── RUN EVERYTHING summary dialog ─────────────────────────────────────────────
+class RunEverythingSummaryDialog(QDialog):
+    """Shown after RUN EVERYTHING finishes. Presents the overall assessment
+    as two simple buckets: what's good, and what needs fixing. The main HTML
+    REPORT remains the place for the fine-grained detail — this dialog is
+    the at-a-glance verdict."""
+
+    def __init__(self, findings_widget, profile_key, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("RUN EVERYTHING — Overall Assessment")
+        self.resize(780, 620)
+        self.findings_widget = findings_widget
+        self.profile_key = profile_key
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("🛡  Overall Security Assessment")
+        title.setObjectName("heading")
+        layout.addWidget(title)
+
+        sysinfo = get_system_info()
+        subtitle = QLabel(
+            f"Host: {sysinfo['hostname']}  •  {sysinfo['os']}  •  "
+            f"Kernel {sysinfo['kernel']}"
+        )
+        subtitle.setStyleSheet(f"color:{T['TEXT_DIM']};font-size:{fs(-1)}px;")
+        layout.addWidget(subtitle)
+
+        # Score + plain-English headline
+        score = RISK.score()
+        label, _ = RISK.label()
+        score_colour = (
+            T["OK"]     if score < 20 else
+            T["WARN"]   if score < 50 else
+            T["DANGER"]
+        )
+        score_row = QHBoxLayout()
+        score_lbl = QLabel(f"Risk score: {score}/100")
+        score_lbl.setStyleSheet(
+            f"color:{score_colour};font-size:{fs(2)}px;font-weight:bold;"
+        )
+        score_row.addWidget(score_lbl)
+        label_lbl = QLabel(label)
+        label_lbl.setStyleSheet(f"color:{T['TEXT_DIM']};font-size:{fs()}px;")
+        score_row.addWidget(label_lbl)
+        score_row.addStretch()
+        layout.addLayout(score_row)
+
+        high   = RISK.findings.count("HIGH")
+        medium = RISK.findings.count("MEDIUM")
+        low    = RISK.findings.count("LOW")
+
+        verdict = QLabel(self._verdict_text(score, high, medium, low))
+        verdict.setWordWrap(True)
+        verdict.setStyleSheet(
+            f"color:{T['TEXT_MAIN']};font-size:{fs()}px;"
+            f"background:{T['BG_CARD']};border-radius:6px;padding:10px;"
+            f"margin-top:6px;"
+        )
+        layout.addWidget(verdict)
+
+        # Build the two buckets from the findings table
+        good_items, bad_items = self._split_findings()
+
+        # Two-column breakdown
+        cols = QHBoxLayout()
+        cols.addLayout(self._bucket_column(
+            "✔ What's good",
+            T["OK"],
+            good_items,
+            "Everything below looks healthy.",
+            "Nothing obvious passed cleanly yet — run scans first.",
+        ))
+        cols.addLayout(self._bucket_column(
+            "⚠ What could do with fixing",
+            T["DANGER"],
+            bad_items,
+            "These items need attention. Higher-risk items are at the top.",
+            "Nothing flagged — good news.",
+        ))
+        layout.addLayout(cols)
+
+        # Session-actions summary ("tasks done")
+        actions_hdr = QLabel(
+            f"🧰  Remediation actions this session ({len(UNDO_LOG)})"
+        )
+        actions_hdr.setStyleSheet(
+            f"color:{T['ACCENT']};font-weight:bold;font-size:{fs()}px;"
+            f"margin-top:10px;"
+        )
+        layout.addWidget(actions_hdr)
+
+        actions_text = QTextEdit()
+        actions_text.setReadOnly(True)
+        actions_text.setMaximumHeight(110)
+        actions_text.setFont(QFont("Courier New", fs(-1)))
+        if UNDO_LOG:
+            actions_text.setPlainText("\n".join(
+                f"{e.get('time','')}   {e.get('action','')}   →   {e.get('cmd','')}"
+                for e in UNDO_LOG
+            ))
+        else:
+            actions_text.setPlainText(
+                "No changes have been made to the system this session.\n"
+                "This was a read-only assessment."
+            )
+        layout.addWidget(actions_text)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        report_btn = QPushButton("📄  Open Full Report")
+        report_btn.setObjectName("ok")
+        report_btn.setToolTip("Save the detailed HTML report")
+        report_btn.clicked.connect(self._open_report)
+        btn_row.addWidget(report_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("neutral")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    # Verdict text mirrors the paragraph in the HTML report so the two feel
+    # consistent. Kept short because this is an at-a-glance view.
+    def _verdict_text(self, score, high, medium, low):
+        if score < 20:
+            headline = "Your system is in great shape."
+        elif score < 50:
+            headline = "Your system is mostly healthy — a few items to look at."
+        elif score < 75:
+            headline = "Your system has real security concerns — address soon."
+        else:
+            headline = "Your system has serious security issues — act today."
+        bits = []
+        if high:
+            bits.append(f"{high} high-priority")
+        if medium:
+            bits.append(f"{medium} medium")
+        if low:
+            bits.append(f"{low} low-priority")
+        counts = ", ".join(bits) if bits else "no outstanding findings"
+        return f"{headline}   ({counts})"
+
+    def _split_findings(self):
+        """Walk the findings table and split into good vs needs-fixing."""
+        good, bad = [], []
+        tbl = self.findings_widget.table
+        priority = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+        for r in range(tbl.rowCount()):
+            name = tbl.item(r, 0).text() if tbl.item(r, 0) else ""
+            ftype = tbl.item(r, 1).text() if tbl.item(r, 1) else ""
+            risk  = tbl.item(r, 2).text() if tbl.item(r, 2) else ""
+            tag   = tbl.item(r, 3).text() if tbl.item(r, 3) else ""
+            detail = tbl.item(r, 4).text() if tbl.item(r, 4) else ""
+            r_upper = risk.upper()
+            # "Good" signals: explicit NORMAL tag, INFO risk, or the all-ok banner
+            if "INFO" in r_upper or "NORMAL" in tag.upper() or "✔" in name:
+                good.append((name, ftype, risk, detail, 3))
+            elif any(k in r_upper for k in ("HIGH", "MEDIUM", "LOW")):
+                rank = next(v for k, v in priority.items() if k in r_upper)
+                bad.append((name, ftype, risk, detail, rank))
+        bad.sort(key=lambda t: t[4])
+        return good, bad
+
+    def _bucket_column(self, title, colour, items, empty_hint_some, empty_hint_none):
+        """Build a single vertical column (header + scrollable list) for
+        one of the two buckets (good / needs-fixing)."""
+        col = QVBoxLayout()
+        hdr = QLabel(title)
+        hdr.setStyleSheet(
+            f"color:{colour};font-weight:bold;font-size:{fs()}px;margin-top:8px;"
+        )
+        col.addWidget(hdr)
+
+        lst = QTextEdit()
+        lst.setReadOnly(True)
+        lst.setFont(QFont("Courier New", fs(-1)))
+        lst.setMinimumHeight(220)
+
+        if items:
+            lines = []
+            for name, ftype, risk, detail, _ in items:
+                # Keep each entry to one line for scannability; full detail is
+                # in the HTML report.
+                truncated = (detail[:90] + "…") if len(detail) > 90 else detail
+                lines.append(f"[{risk}] {name}  ({ftype})")
+                if truncated:
+                    lines.append(f"    {truncated}")
+                lines.append("")
+            lst.setPlainText("\n".join(lines))
+        else:
+            lst.setPlainText(empty_hint_none)
+            lst.setStyleSheet(f"color:{T['TEXT_DIM']};")
+        col.addWidget(lst)
+
+        hint = QLabel(empty_hint_some if items else "")
+        hint.setStyleSheet(f"color:{T['TEXT_DIM']};font-size:{fs(-2)}px;")
+        hint.setWordWrap(True)
+        col.addWidget(hint)
+        return col
+
+    def _open_report(self):
+        """Generate the detailed HTML report, save to ~ and auto-open in the
+        default browser. No file dialog — the summary view is the "quick"
+        entry point, so this should feel one-click."""
+        host = re.sub(r"[^A-Za-z0-9._-]", "_", get_system_info().get("hostname") or "host")
+        fname = f"audit-report-{host}-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.html"
+        path = str(Path.home() / fname)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(generate_report(self.findings_widget, self.profile_key, "executive"))
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Could not save report:\n{e}")
+            return
+        opened = False
+        try:
+            opened = webbrowser.open(Path(path).as_uri())
+        except Exception:
+            opened = False
+        if not opened:
+            QMessageBox.information(
+                self, "Report Saved",
+                f"Full report saved:\n{path}\n\n"
+                "Could not auto-open your browser — open the file manually to view."
+            )
+
+
 # ── HTML report generator ─────────────────────────────────────────────────────
+def _collect_findings_by_section(findings_widget):
+    """Walk the findings table and bucket every row by its sidebar section.
+    Keys match the left-menu groups so the report mirrors the nav."""
+    sections = {
+        "scan":   [],  # LEFTOVER / NETWORK / SERVICE
+        "checks": [],  # HARDENING
+        "cve":    [],  # CVE / OUTDATED / UPDATE
+        "info":   [],  # anything else (NORMAL/INFO markers, banners)
+    }
+    tbl = findings_widget.table
+    for r in range(tbl.rowCount()):
+        name = tbl.item(r, 0).text() if tbl.item(r, 0) else ""
+        ftype = tbl.item(r, 1).text() if tbl.item(r, 1) else ""
+        risk = tbl.item(r, 2).text() if tbl.item(r, 2) else ""
+        tag  = tbl.item(r, 3).text() if tbl.item(r, 3) else ""
+        detail = tbl.item(r, 4).text() if tbl.item(r, 4) else ""
+        row = {"name": name, "ftype": ftype, "risk": risk, "tag": tag, "detail": detail}
+        ft_upper = ftype.upper()
+        if ft_upper in ("LEFTOVER", "NETWORK", "SERVICE"):
+            sections["scan"].append(row)
+        elif ft_upper == "HARDENING":
+            sections["checks"].append(row)
+        elif ft_upper in ("CVE", "OUTDATED", "UPDATE"):
+            sections["cve"].append(row)
+        else:
+            sections["info"].append(row)
+    return sections
+
+
+def _build_exec_statement(score, high, medium, low, actions_taken):
+    """Return a plain-English paragraph summarising the overall assessment.
+    Used at the top of the report so a non-technical reader gets the gist."""
+    if score < 20:
+        headline = "Your system is in great shape."
+        tone     = "Keep doing what you're doing — the fundamentals are in place."
+    elif score < 50:
+        headline = "Your system is mostly healthy, with a few items worth addressing."
+        tone     = "Most of what's flagged below is low-effort to resolve."
+    elif score < 75:
+        headline = "Your system has real security concerns that should be addressed soon."
+        tone     = "Focus on the high-priority items first — they open the biggest doors."
+    else:
+        headline = "Your system has serious security issues that need urgent attention."
+        tone     = "Start with the high-priority findings today — don't put this off."
+
+    detail_bits = []
+    if high:
+        detail_bits.append(
+            f"<b style='color:#ff4444;'>{high} high-priority</b> item"
+            + ("s" if high != 1 else "")
+            + " (address first)"
+        )
+    if medium:
+        detail_bits.append(
+            f"<b style='color:#f0a500;'>{medium} medium</b> item"
+            + ("s" if medium != 1 else "")
+        )
+    if low:
+        detail_bits.append(
+            f"<b style='color:#3fb950;'>{low} low-priority</b> item"
+            + ("s" if low != 1 else "")
+        )
+    breakdown = ", ".join(detail_bits) if detail_bits else "no outstanding findings"
+    action_note = (
+        f"You have taken <b>{actions_taken}</b> remediation action"
+        + ("s" if actions_taken != 1 else "")
+        + " this session."
+        if actions_taken
+        else "No remediation actions have been taken yet — running the fixes "
+             "in the sections below will improve this score."
+    )
+    return (
+        f"<p style='font-size:16px;margin:0 0 8px 0;'><b>{headline}</b></p>"
+        f"<p style='margin:0 0 8px 0;'>{tone}</p>"
+        f"<p style='margin:0 0 8px 0;'>This audit found {breakdown}.</p>"
+        f"<p style='margin:0;'>{action_note}</p>"
+    )
+
+
+def _render_finding_rows(rows):
+    """Render a list of finding dicts as HTML table rows. Empty list returns
+    an explicit 'nothing found' row so the section never looks broken."""
+    if not rows:
+        return (
+            "<tr><td colspan=5 style='color:#3fb950;text-align:center;'>"
+            "✔ Nothing flagged in this section — good."
+            "</td></tr>"
+        )
+    # Sort HIGH → MEDIUM → LOW → INFO so the most urgent stuff is at the top.
+    priority = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+    def _rank(r):
+        for k, v in priority.items():
+            if k in r["risk"].upper():
+                return v
+        return 4
+    rows = sorted(rows, key=_rank)
+
+    out = []
+    for r in rows:
+        risk_upper = r["risk"].upper()
+        rc = (
+            "#ff4444" if "HIGH" in risk_upper else
+            "#f0a500" if "MEDIUM" in risk_upper else
+            "#3fb950" if "LOW" in risk_upper else
+            "#8b949e"
+        )
+        out.append(
+            f"<tr>"
+            f"<td>{html.escape(r['name'])}</td>"
+            f"<td>{html.escape(r['ftype'])}</td>"
+            f"<td style='color:{rc};font-weight:bold'>{html.escape(r['risk'])}</td>"
+            f"<td>{html.escape(r['tag'])}</td>"
+            f"<td>{html.escape(r['detail'])}</td>"
+            f"</tr>"
+        )
+    return "\n".join(out)
+
+
 def generate_report(findings_widget, profile_key, mode="executive"):
     """Generate a complete HTML security report.
-    Executive mode: plain English, key stats, readable by anyone.
-    Technical mode: all raw data, CVE numbers, full findings list."""
+    The report mirrors the app's left sidebar so each top-level nav section
+    (Scan Your System, Security Checks, CVE Vulnerability Check, Recommended
+    Tools, Undo/Rollback) has its own block in the output.
+    Executive mode leads with a plain-English assessment; Technical mode
+    keeps the same structure but tones down the preamble."""
     score = RISK.score()
     label, _ = RISK.label()
     profile_label = PROFILES.get(profile_key, {}).get("label", "Unknown")
-    try:
-        hostname = subprocess.run(
-            ["hostname"], capture_output=True, text=True, timeout=3
-        ).stdout.strip()
-    except Exception:
-        hostname = "Unknown"
+    sysinfo = get_system_info()
+    hostname = sysinfo["hostname"]
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sc = "#3fb950" if score < 20 else ("#f0a500" if score < 50 else "#ff4444")
-    h  = RISK.findings.count("HIGH")
-    m  = RISK.findings.count("MEDIUM")
-    l  = RISK.findings.count("LOW")
+    high   = RISK.findings.count("HIGH")
+    medium = RISK.findings.count("MEDIUM")
+    low    = RISK.findings.count("LOW")
 
-    tbl = findings_widget.table
-    rows = ""
-    for r in range(tbl.rowCount()):
-        n  = html.escape(tbl.item(r,0).text() if tbl.item(r,0) else "")
-        ft = html.escape(tbl.item(r,1).text() if tbl.item(r,1) else "")
-        ri = html.escape(tbl.item(r,2).text() if tbl.item(r,2) else "")
-        tg = html.escape(tbl.item(r,3).text() if tbl.item(r,3) else "")
-        dt = html.escape(tbl.item(r,4).text() if tbl.item(r,4) else "")
-        rc = "#ff4444" if "HIGH" in ri else ("#f0a500" if "MEDIUM" in ri else "#3fb950")
-        rows += (
-            f"<tr><td>{n}</td><td>{ft}</td>"
-            f"<td style='color:{rc};font-weight:bold'>{ri}</td>"
-            f"<td>{tg}</td><td>{dt}</td></tr>\n"
-        )
+    sections = _collect_findings_by_section(findings_widget)
+    actions_taken = len(UNDO_LOG)
 
     if mode == "executive":
-        words = (
-            "Your system is in great shape" if score < 20 else
-            "Your system is mostly healthy with a few items to look at" if score < 50 else
-            "Your system has some security concerns worth addressing" if score < 75 else
-            "Your system has serious security issues that need urgent attention"
-        )
-        cheeky = [
-            "Not bad at all 😎", "Could be worse!", "You've been warned 😬",
-            "Houston, we have a problem 🚨"
-        ][0 if score<20 else 1 if score<50 else 2 if score<75 else 3]
-        exec_section = f"""
-        <div style="background:#1a2a1a;border:1px solid #3fb950;border-radius:8px;padding:16px;margin:16px 0;">
-            <h2 style="color:#3fb950;margin:0 0 8px 0;">In Plain English</h2>
-            <p style="font-size:16px;margin:0;">{words}. {cheeky}</p>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0;">
-            <div style="background:#21262d;border-radius:6px;padding:12px;text-align:center;">
-                <div style="color:#ff4444;font-size:28px;font-weight:bold;">{h}</div>
-                <div style="color:#8b949e;">High Priority</div>
-                <div style="color:#e6edf3;font-size:11px;">Fix these first</div>
-            </div>
-            <div style="background:#21262d;border-radius:6px;padding:12px;text-align:center;">
-                <div style="color:#f0a500;font-size:28px;font-weight:bold;">{m}</div>
-                <div style="color:#8b949e;">Medium Priority</div>
-            </div>
-            <div style="background:#21262d;border-radius:6px;padding:12px;text-align:center;">
-                <div style="color:#3fb950;font-size:28px;font-weight:bold;">{l}</div>
-                <div style="color:#8b949e;">Low Priority</div>
-            </div>
-        </div>"""
+        exec_block = _build_exec_statement(score, high, medium, low, actions_taken)
     else:
-        exec_section = "<p style='color:#8b949e;'>Technical report — all findings listed below.</p>"
+        exec_block = (
+            "<p style='color:#8b949e;margin:0;'>"
+            "Technical report — full detail for every finding is listed below, "
+            "grouped by the sidebar section that produced it."
+            "</p>"
+        )
 
+    # Recommended-tools summary — count installed vs not so the report tells
+    # the reader what extra defensive tooling they have (and don't have).
+    try:
+        tools_installed = [t for t in TOOLS_DATA if pkg_installed(t["name"])]
+        tools_missing   = [t for t in TOOLS_DATA if not pkg_installed(t["name"])]
+    except Exception:
+        tools_installed, tools_missing = [], []
+    tools_rows_installed = "".join(
+        f"<tr><td>{html.escape(t['name'])}</td>"
+        f"<td>{html.escape(t['cat'])}</td>"
+        f"<td style='color:#3fb950;'>✔ Installed</td>"
+        f"<td>{html.escape(t['desc'])}</td></tr>"
+        for t in tools_installed
+    )
+    tools_rows_missing = "".join(
+        f"<tr><td>{html.escape(t['name'])}</td>"
+        f"<td>{html.escape(t['cat'])}</td>"
+        f"<td style='color:#8b949e;'>Not installed</td>"
+        f"<td>{html.escape(t['desc'])}</td></tr>"
+        for t in tools_missing
+    )
+
+    # Undo / rollback log
     undo_rows = "".join(
         f"<tr>"
         f"<td>{html.escape(e.get('time',''))}</td>"
@@ -4839,43 +5528,121 @@ def generate_report(findings_widget, profile_key, mode="executive"):
         for e in UNDO_LOG
     )
 
+    # System information block
+    sys_rows = "".join(
+        f"<tr><td style='color:#8b949e;width:160px;'>{k}</td><td>{html.escape(v)}</td></tr>"
+        for k, v in [
+            ("Hostname",        sysinfo["hostname"]),
+            ("Operating System", sysinfo["os"]),
+            ("Kernel",          sysinfo["kernel"]),
+            ("Architecture",    sysinfo["arch"]),
+            ("CPU",             sysinfo["cpu"]),
+            ("Memory",          sysinfo["ram"]),
+            ("Uptime",          sysinfo["uptime"]),
+            ("Package manager", PKG_MGR),
+            ("System profile",  profile_label),
+        ]
+    )
+
+    counts = {
+        "scan":   len(sections["scan"]),
+        "checks": len(sections["checks"]),
+        "cve":    len(sections["cve"]),
+    }
+
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <title>Linux Audit Report — {html.escape(hostname)}</title>
 <style>
 body{{font-family:monospace;background:#0d1117;color:#e6edf3;padding:24px;max-width:1100px;margin:0 auto;}}
-h1{{color:#00d9ff;}} h2{{color:#00d9ff;border-bottom:1px solid #30363d;padding-bottom:6px;margin-top:24px;}}
+h1{{color:#00d9ff;}}
+h2{{color:#00d9ff;border-bottom:1px solid #30363d;padding-bottom:6px;margin-top:32px;}}
+h3{{color:#e6edf3;margin-top:18px;}}
 .score{{font-size:2.5em;font-weight:bold;color:{sc};}}
 table{{border-collapse:collapse;width:100%;margin-top:12px;}}
 th{{background:#21262d;color:#8b949e;padding:8px;text-align:left;font-size:11px;letter-spacing:1px;}}
-td{{padding:8px;border-bottom:1px solid #30363d;font-size:12px;}}
+td{{padding:8px;border-bottom:1px solid #30363d;font-size:12px;vertical-align:top;}}
 tr:hover{{background:#161b22;}}
 .meta{{color:#8b949e;font-size:12px;margin-bottom:20px;}}
+.exec-box{{background:#1a2a1a;border:1px solid #3fb950;border-radius:8px;padding:16px;margin:16px 0;}}
+.exec-box h2{{color:#3fb950;margin:0 0 8px 0;border:none;padding:0;}}
+.stat-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0;}}
+.stat{{background:#21262d;border-radius:6px;padding:12px;text-align:center;}}
+.stat .num{{font-size:28px;font-weight:bold;}}
+.stat .lbl{{color:#8b949e;margin-top:4px;}}
+.section-sub{{color:#8b949e;font-style:italic;margin:0 0 6px 0;}}
 footer{{color:#8b949e;font-size:11px;text-align:center;margin-top:40px;border-top:1px solid #30363d;padding-top:16px;}}
 </style>
 </head><body>
 <h1>⬡ Linux Security Audit Report</h1>
 <div class="meta">
-Hostname: <b>{html.escape(hostname)}</b> |
+Host: <b>{html.escape(hostname)}</b> |
 Profile: {html.escape(profile_label)} |
 Generated: {ts} |
 Mode: {"Executive" if mode == "executive" else "Technical"}
 </div>
-<h2>Risk Score</h2>
-<div class="score">{score} / 100</div>
-<div style="color:#8b949e;font-size:14px;margin-top:4px;">{label}</div>
-{exec_section}
-<h2>All Findings ({tbl.rowCount()})</h2>
+
+<h2>Overall Assessment</h2>
+<div class="exec-box">
+  <h2>In Plain English</h2>
+  {exec_block}
+</div>
+<div style="margin:8px 0;">
+  <span style="color:#8b949e;">Risk score:</span>
+  <span class="score">{score} / 100</span>
+  <span style="color:#8b949e;margin-left:8px;">{label}</span>
+</div>
+<div class="stat-grid">
+  <div class="stat"><div class="num" style="color:#ff4444;">{high}</div><div class="lbl">High priority</div></div>
+  <div class="stat"><div class="num" style="color:#f0a500;">{medium}</div><div class="lbl">Medium priority</div></div>
+  <div class="stat"><div class="num" style="color:#3fb950;">{low}</div><div class="lbl">Low priority</div></div>
+</div>
+
+<h2>System Information</h2>
+<table>{sys_rows}</table>
+
+<h2>Scan Your System ({counts['scan']})</h2>
+<p class="section-sub">Findings from package, network-port and service scans.</p>
 <table>
 <tr><th>NAME</th><th>TYPE</th><th>RISK</th><th>TAG</th><th>DETAIL</th></tr>
-{rows}
+{_render_finding_rows(sections["scan"])}
 </table>
-<h2>Actions Taken This Session</h2>
+
+<h2>Security Checks ({counts['checks']})</h2>
+<p class="section-sub">OS hardening findings — Lynis audit and quick security checks.</p>
+<table>
+<tr><th>NAME</th><th>TYPE</th><th>RISK</th><th>TAG</th><th>DETAIL</th></tr>
+{_render_finding_rows(sections["checks"])}
+</table>
+
+<h2>CVE Vulnerability Check ({counts['cve']})</h2>
+<p class="section-sub">Known vulnerabilities in installed software and available updates.</p>
+<table>
+<tr><th>NAME</th><th>TYPE</th><th>RISK</th><th>TAG</th><th>DETAIL</th></tr>
+{_render_finding_rows(sections["cve"])}
+</table>
+
+<h2>Recommended Tools ({len(tools_installed)} installed / {len(tools_missing)} missing)</h2>
+<p class="section-sub">Extra security and monitoring tools the app can manage.</p>
+<h3>Installed</h3>
+<table>
+<tr><th>NAME</th><th>CATEGORY</th><th>STATUS</th><th>WHAT IT DOES</th></tr>
+{tools_rows_installed if tools_rows_installed else "<tr><td colspan=4 style='color:#8b949e;'>None of the recommended tools are installed yet.</td></tr>"}
+</table>
+<h3>Missing — worth considering</h3>
+<table>
+<tr><th>NAME</th><th>CATEGORY</th><th>STATUS</th><th>WHAT IT DOES</th></tr>
+{tools_rows_missing if tools_rows_missing else "<tr><td colspan=4 style='color:#3fb950;'>✔ You have every recommended tool installed.</td></tr>"}
+</table>
+
+<h2>Undo / Rollback Log ({len(UNDO_LOG)})</h2>
+<p class="section-sub">Actions taken this session — each one has a rollback command.</p>
 <table>
 <tr><th>TIME</th><th>ACTION</th><th>COMMAND</th><th>RISK LEVEL</th><th>UNDO COMMAND</th></tr>
 {undo_rows if undo_rows else "<tr><td colspan=5 style='color:#8b949e;'>No actions taken this session.</td></tr>"}
 </table>
+
 <footer>Linux Security Dashboard v4.2 | {L('built_by')} | github.com/playdoggs/linux-security-dashboard</footer>
 </body></html>"""
 
@@ -4994,9 +5761,10 @@ class AuditDashboard(QMainWindow):
 
         # Toolbar action buttons
         for lbl3, tip3, handler3 in [
+            ("▶  RUN EVERYTHING",    "Run every non-sudo scan and show an at-a-glance assessment of what's good and what needs fixing", self._run_everything),
             ("📋  What's Been Done?", "Plain English summary of everything done this session", self._show_session_summary),
             ("👤  CHANGE PROFILE",   "Re-detect or manually select your system profile",       self._detect_profile),
-            ("📄  REPORT",           "Generate a security report as an HTML file",              self._generate_report),
+            ("📄  REPORT",           "Generate a detailed HTML security report",                self._generate_report),
             ("{ }  SHOW CODE",       "See every command this app can run — full transparency",  self._show_code),
             ("🪲  DEV LOG",          "Show the application error/debug log in the terminal",    self._show_dev_log),
         ]:
@@ -5084,9 +5852,14 @@ class AuditDashboard(QMainWindow):
             self.risk_panel.set_profile(self.profile_key)
             self.findings.profile_key = self.profile_key
 
-        # Welcome message in terminal
+        # Welcome message in terminal — includes hostname + OS so the user
+        # knows at a glance which machine they're auditing.
+        sysinfo = get_system_info()
         self.terminal.append(
             f"Linux Security Dashboard v4.2 ready.\n"
+            f"Host: {sysinfo['hostname']}  |  "
+            f"OS: {sysinfo['os']}  |  "
+            f"Kernel: {sysinfo['kernel']}\n"
             f"Profile: {PROFILES.get(self.profile_key,{}).get('label','Unknown')}  |  "
             f"Mode: {'Expert' if self.expert_mode else 'Simple'}  |  "
             f"{'Online' if self.online_mode else 'Offline'}",
@@ -5199,6 +5972,12 @@ class AuditDashboard(QMainWindow):
         """Show the 'What Have I Done?' session summary popup."""
         SessionSummaryDialog(self).exec()
 
+    def _run_everything(self):
+        """Toolbar handler — chain every non-sudo scan, then show assessment."""
+        def _show_summary():
+            RunEverythingSummaryDialog(self.findings, self.profile_key, self).exec()
+        self.sidebar.run_everything(on_complete=_show_summary)
+
     def _generate_report(self):
         """Generate and save an HTML report — Executive or Technical format."""
         dlg = QDialog(self)
@@ -5226,9 +6005,10 @@ class AuditDashboard(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         mode = "executive" if exec_rb.isChecked() else "technical"
+        host = re.sub(r"[^A-Za-z0-9._-]", "_", get_system_info().get("hostname") or "host")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Report",
-            f"audit-report-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.html",
+            f"audit-report-{host}-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.html",
             "HTML Files (*.html)"
         )
         if path:

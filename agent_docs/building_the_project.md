@@ -1,36 +1,37 @@
 # Build Instructions
-<!-- AGENT: Read this first. No build step — just run. -->
+
+## Overview
+No compile step. Run the Python application directly.
 
 ## Requirements
-- Python 3.10+  (`python3 --version`)
-- PyQt6: `pip install PyQt6 --break-system-packages`
-- Optional system tools (features degrade gracefully without them):
-  `sudo apt install libxcb-cursor0 deborphan lynis`
+- Python 3.10+
+- PyQt6
+- Optional feature tools:
+  - `deborphan` (unused package scan)
+  - `lynis` (hardening audit)
+  - `libxcb-cursor0` (common Qt runtime dependency on Debian/Ubuntu)
 
-## Launch
+## Install (example)
+```bash
+sudo apt install python3 python3-pip libxcb-cursor0 deborphan lynis
+pip install PyQt6 --break-system-packages
+```
+
+## Run
 ```bash
 python3 linux-security-dashboard.py
 ```
 
-## Files
-| File | Purpose |
-|------|---------|
-| `linux-security-dashboard.py` | Complete app — single file, ~5070 lines |
-| `~/.audit-dashboard.conf` | Saved prefs: theme, lang, profile, sidebar collapse state |
-| `~/.audit-dashboard-undo.log` | Persistent undo log — JSON Lines, one dict per action |
-| `~/.audit-dashboard-errors.log` | Error log — written by `init_logging()`, never crashes app |
+## Files created at runtime
+- `~/.audit-dashboard.conf`
+- `~/.audit-dashboard-undo.log`
+- `~/.audit-dashboard-errors.log` (or `/tmp/.audit-dashboard-errors.log` fallback)
 
-## Validation — can it start?
+## Sanity checks
 ```bash
-python3 -c "import PyQt6; print('PyQt6 ok')"
-python3 -c "import sys; ast = __import__('ast'); ast.parse(open('linux-security-dashboard.py').read()); print('syntax ok')"
-python3 linux-security-dashboard.py   # run it
+python3 -m py_compile linux-security-dashboard.py
+python3 linux-security-dashboard.py
 ```
 
-## Key imports (if you see ImportError these must be present)
-```python
-import time, socket          # used in HttpWorker retry/timeout
-import base64                # embedded face PNG data
-from PyQt6.QtWidgets import ... QSplitterHandle
-from PyQt6.QtGui    import ... QPainter
-```
+## Current code size
+- `linux-security-dashboard.py`: ~6145 lines (2026-04-23).

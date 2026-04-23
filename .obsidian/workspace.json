@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "agent_docs/running_tests.md",
+                "file": "agent_docs/building_the_project.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "running_tests"
+              "title": "building_the_project"
             }
           }
         ]
@@ -183,8 +183,10 @@
       "bases:Create new base": false
     }
   },
-  "active": "2ef82a7f1f337b92",
+  "active": "49e9dbc5461e097f",
   "lastOpenFiles": [
+    "linux-security-dashboard.py.tmp.1476916.1776657864789",
+    "agent_docs/running_tests.md",
     "agent_docs/known_bugs.md",
     "agent_docs/database_schema.md",
     "agent_docs/code_conventions.md",
@@ -204,7 +206,6 @@
     "__pycache__/linux-audit-dashboard-v3.cpython-312.pyc",
     "agent_docs/service_communication_patterns.md",
     "agent_docs/service_architecture.md",
-    "agent_docs/running_tests.md",
     "claude.md"
   ]
 }
