@@ -21,7 +21,7 @@ You are an agent with a Documentation-First mandate. Technical state must be mir
 # CLAUDE.md — AI Developer Context
 
 ## Project Summary
-Linux Security Dashboard is a PyQt6 desktop app that audits Linux security posture in plain English.
+Linux Security Dashboard is a PyQt6 desktop app that audits Linux security posture in everyday language.
 
 Core principles:
 1. No system-changing action without explicit confirmation.

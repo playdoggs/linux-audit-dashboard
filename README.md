@@ -19,8 +19,8 @@ This tool assumes you don't — and that's fine.
 
 - **Scans** your system for orphaned packages, open ports, and risky services
 - **Checks** installed packages against Ubuntu's live CVE vulnerability database
-- **Runs Lynis** (industry-standard audit tool) and translates the output into plain English
-- **Explains** every finding in plain English — what it is, why it matters, what happens if you ignore it
+- **Runs Lynis** (industry-standard audit tool) and translates the output into everyday language
+- **Explains** every finding in everyday language — what it is, why it matters, what happens if you ignore it
 - **One-click fixes** with a confirmation dialog that shows exactly what will run before anything happens
 - **Guided Fix Wizard** — step-by-step walkthroughs for common security fixes
 - **Tool Manager** — installs and explains security/monitoring tools like rkhunter, fail2ban, smartmontools
@@ -32,7 +32,7 @@ This tool assumes you don't — and that's fine.
 - **Risk Score** — 0 to 100, updates live as scans run
 - **Duke Nukem health face** — gets progressively more battered as your risk score rises 😄
 - **Undo Log** — every action recorded, one-click rollback, survives restarts
-- **HTML Report** — plain English (Executive) or full technical deep-dive; filename auto-tagged with hostname
+- **HTML Report** — everyday language (Executive) or full technical deep-dive; filename auto-tagged with hostname
 - **Auto-detects** what kind of machine you're running (Gaming Rig, Home Server, Docker Host, etc.) and adjusts what's flagged as normal vs suspicious
 - **Multiple themes** — Dark, Hacker, Solarized, Light, Pink
 - **Multiple languages** — 12 built in (English, German, French, Spanish, Italian, Portuguese, Dutch, Japanese, Chinese Simplified, Arabic with RTL, and more)
@@ -100,7 +100,7 @@ python3 linux-security-dashboard.py
 | <img src="https://github.com/user-attachments/assets/89dc34d3-12b0-455f-9502-287d5746884b" width="400" /> | <img src="https://github.com/user-attachments/assets/8b587be8-dec4-401b-8ea8-7a72f35b27d6" width="400" /> |
 | **Duke Nukem Health Status** | **Smart Profile Detection** |
 
-| Vulnerability (CVE) Scanning | Plain English Explanations |
+| Vulnerability (CVE) Scanning | Everyday Language Explanations |
 | :---: | :---: |
 | <img src="https://github.com/user-attachments/assets/bdb0feac-bc92-4a92-9d26-801036f005ed" width="400" /> | <img src="https://github.com/user-attachments/assets/b8fc71bd-7da5-4000-9f91-0918084f5c3d" width="400" /> |
 | **Deep Security Scanning** | **Jargon-Free Insights** |
@@ -127,7 +127,7 @@ python3 linux-security-dashboard.py
 - [x] Lynis integration
 - [x] Quick hardening checks
 - [x] Guided Fix Wizard
-- [x] Plain English explanations on every finding
+- [x] Everyday Language explanations on every finding
 - [x] Risk score 0-100
 - [x] Undo/rollback log
 - [x] System profile auto-detection

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Linux Security Dashboard v4.2
-A security health check tool for Linux — plain English, no jargon.
+A security health check tool for Linux — everyday language, no jargon.
 Built by playdoggy 2026
 https://github.com/playdoggs/linux-security-dashboard
 
 This app scans your Linux system for security issues, explains them
-in plain English, and lets you fix them safely with full confirmation
+in everyday language, and lets you fix them safely with full confirmation
 before anything is changed on your system.
 """
 
@@ -39,9 +39,9 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QScrollArea, QComboBox, QStatusBar,
     QFileDialog, QListWidget, QListWidgetItem, QStackedWidget,
     QRadioButton, QButtonGroup, QLineEdit, QCheckBox, QGroupBox,
-    QSizePolicy, QScrollBar, QInputDialog, QSplitterHandle
+    QSizePolicy, QScrollBar, QInputDialog, QSplitterHandle, QTimeEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QTime
 # QShortcut is in QtGui in PyQt6 (moved from QtWidgets in Qt5)
 from PyQt6.QtGui import (
     QFont, QColor, QPalette, QTextCursor, QPixmap,
@@ -152,7 +152,7 @@ THEMES = {
     "Solarized": {
         "BG_DARK":"#002b36","BG_MID":"#073642","BG_CARD":"#073642",
         "ACCENT":"#268bd2","WARN":"#cb4b16","DANGER":"#dc322f","OK":"#859900",
-        "TEXT_MAIN":"#839496","TEXT_DIM":"#586e75","BORDER":"#073642","SIDEBAR":"#002b36"
+        "TEXT_MAIN":"#839496","TEXT_DIM":"#586e75","BORDER":"#001a21","SIDEBAR":"#002b36"
     },
     "Light": {
         "BG_DARK":"#ffffff","BG_MID":"#f6f8fa","BG_CARD":"#eaeef2",
@@ -445,7 +445,7 @@ QGroupBox::title {{
 LANGS = {
     "EN": {
         "title":"LINUX SECURITY DASHBOARD v4.2",
-        "findings_hdr":"FINDINGS — double-click any row for a plain English explanation",
+        "findings_hdr":"FINDINGS — double-click any row for a everyday language explanation",
         "terminal_hdr":"TERMINAL OUTPUT",
         "risk_label":"SYSTEM HEALTH",
         "mode_simple":"Simple Mode",
@@ -834,7 +834,7 @@ def prompt_for_sudo_password(parent, reason_text, terminal=None, force_prompt=Fa
 
 # ── Rollback risk database ────────────────────────────────────────────────────
 # For each action type, explains what rollback does, the risk that returns,
-# and in plain English how an attacker could exploit that risk.
+# and in everyday language how an attacker could exploit that risk.
 ROLLBACK_RISK = {
     "ftp": {
         "does":    "Reinstalls the FTP package on your machine",
@@ -903,7 +903,7 @@ def get_rollback_info(cmd, name):
     }
 
 # ── Recommended tools database ────────────────────────────────────────────────
-# Each tool has a plain English description, reason why you want it,
+# Each tool has a everyday language description, reason why you want it,
 # how to set it up, how to verify it works, and the command to run it.
 TOOLS_DATA = [
     {
@@ -1012,7 +1012,7 @@ TOOLS_DATA = [
     },
     {
         "name": "logwatch", "cat": "Monitoring",
-        "desc": "Analyses your system logs and produces a plain English daily summary",
+        "desc": "Analyses your system logs and produces a everyday language daily summary",
         "why": "Get a daily report of what happened on your system — catch unusual activity, failed logins, and errors before they become problems.",
         "setup": "After install: sudo logwatch --output stdout --detail low",
         "verify": "Run: sudo logwatch --output stdout --range today --detail low",
@@ -1085,7 +1085,7 @@ class SessionTracker:
         self.actions_taken.append((action, name, datetime.datetime.now(), succeeded))
 
     def build_summary(self):
-        """Build a plain English summary string for the popup."""
+        """Build a everyday language summary string for the popup."""
         now = datetime.datetime.now()
         duration = now - self.start_time
         mins = int(duration.total_seconds() / 60)
@@ -1338,6 +1338,104 @@ class CommandWorker(QThread):
 
         except Exception as e:
             logging.error(f"CommandWorker error: {e}")
+            self.error_ready.emit(str(e))
+        finally:
+            self.finished_ok.emit()
+
+
+class StreamingCommandWorker(QThread):
+    """Command worker that emits stdout line-by-line as the process runs.
+
+    Unlike `CommandWorker` (which uses `subprocess.run` and buffers the
+    entire output until exit), this uses `subprocess.Popen` and pumps
+    each line out via `output_ready` the moment it arrives. Used for
+    long-running tools like Lynis so the user sees audit progress in
+    real time rather than staring at a frozen 'please wait' for 60s.
+
+    Signal shape matches `CommandWorker` so callers can swap workers with
+    minimal change. Output is flushed to stdout only — stderr is captured
+    separately and emitted on completion for parity with apt-style tools
+    that write warnings to stderr on success."""
+
+    output_ready = pyqtSignal(str)
+    error_ready  = pyqtSignal(str)
+    finished_ok  = pyqtSignal()
+
+    def __init__(self, cmd, sudo=False, timeout=300, password=None):
+        super().__init__()
+        self.cmd      = cmd
+        self.sudo     = sudo
+        self.timeout  = timeout
+        self.password = password
+
+    def run(self):
+        try:
+            if self.sudo and self.password:
+                full = ["sudo", "-S"] + self.cmd
+                stdin = subprocess.PIPE
+                input_bytes = self.password + b"\n"
+            elif self.sudo:
+                full = ["sudo"] + self.cmd
+                stdin = subprocess.DEVNULL
+                input_bytes = None
+            else:
+                full = self.cmd
+                stdin = subprocess.DEVNULL
+                input_bytes = None
+
+            proc = subprocess.Popen(
+                full,
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,          # line-buffered
+                text=True,
+            )
+            # Send the sudo password once, then close stdin so the child
+            # doesn't hang waiting for more input.
+            if input_bytes is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.write(input_bytes.decode())
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            # Collect full stdout on the worker object so the caller can
+            # grab it from `finished_ok` without replaying every emission.
+            buf = []
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    buf.append(line)
+                    clean = strip_ansi(line.rstrip("\n"))
+                    if clean:
+                        self.output_ready.emit(clean)
+
+            try:
+                proc.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                self.error_ready.emit(
+                    f"Command timed out after {self.timeout} seconds."
+                )
+
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+            if stderr:
+                stderr = "\n".join(
+                    l for l in stderr.splitlines()
+                    if not l.lower().startswith("[sudo]")
+                    and "password" not in l.lower()
+                )
+                if stderr and proc.returncode != 0:
+                    self.error_ready.emit(stderr)
+
+            # Expose full stdout for post-run parsers (e.g. Lynis).
+            self.full_output = "".join(buf)
+
+        except FileNotFoundError:
+            self.error_ready.emit(f"Command not found: {self.cmd[0]}")
+        except Exception as e:
+            logging.error(f"StreamingCommandWorker error: {e}")
             self.error_ready.emit(str(e))
         finally:
             self.finished_ok.emit()
@@ -1706,7 +1804,7 @@ class PreActionDialog(QDialog):
         )
         layout.addWidget(cmd_box)
 
-        # Plain English explanation of what will happen
+        # Everyday Language explanation of what will happen
         impact_text = {
             "remove":  f"'{name}' will be completely removed from your system, including its configuration files.",
             "disable": f"'{name}' will be stopped immediately and will not start again on future boots.",
@@ -1769,7 +1867,7 @@ class PreActionDialog(QDialog):
         layout.addWidget(btns)
 
 
-# ── Plain English explanation database ───────────────────────────────────────
+# ── Everyday Language explanation database ───────────────────────────────────────
 # For each finding type we know about, we have four sections:
 # what it is, why it matters, what happens if ignored, and how to fix it.
 EXPLANATIONS = {
@@ -1842,12 +1940,12 @@ GLOSSARY = {
 
 
 class ExplainDialog(QDialog):
-    """Shows a plain English explanation of any finding.
+    """Shows a everyday language explanation of any finding.
     Triggered by double-clicking a row or clicking the ? button."""
 
     def __init__(self, name, ftype, risk, detail, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Plain English Explanation")
+        self.setWindowTitle("Everyday Language Explanation")
         self.setMinimumSize(580, 420)
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -2109,13 +2207,13 @@ class FindingsTable(QWidget, WorkerMixin):
         cell = QWidget()
         cell.setStyleSheet("background:transparent;")
         bl = QHBoxLayout(cell)
-        bl.setContentsMargins(4, 3, 4, 3)
-        bl.setSpacing(4)
+        bl.setContentsMargins(3, 2, 3, 2)
+        bl.setSpacing(3)
 
         exp_btn = QPushButton("?")
         exp_btn.setObjectName("neutral")
-        exp_btn.setFixedSize(28, 28)
-        exp_btn.setToolTip("Explain this finding in plain English")
+        exp_btn.setFixedSize(22, 22)
+        exp_btn.setToolTip("Explain this finding in everyday language")
         exp_btn.clicked.connect(
             lambda _, n=name, ft=ftype, r=risk, d=detail:
             ExplainDialog(n, ft, r, d, self.table).exec()
@@ -2124,7 +2222,7 @@ class FindingsTable(QWidget, WorkerMixin):
 
         ign_btn = QPushButton("✕")
         ign_btn.setObjectName("neutral")
-        ign_btn.setFixedSize(28, 28)
+        ign_btn.setFixedSize(22, 22)
         ign_btn.setToolTip("Ignore this finding for this session")
         ign_btn.clicked.connect(lambda _, n=name: self._ignore(n))
         bl.addWidget(ign_btn)
@@ -2132,8 +2230,8 @@ class FindingsTable(QWidget, WorkerMixin):
         if cmd_remove:
             rb = QPushButton("REMOVE")
             rb.setObjectName("danger")
-            rb.setMinimumWidth(80)
-            rb.setFixedHeight(28)
+            rb.setMinimumWidth(66)
+            rb.setFixedHeight(22)
             rb.setToolTip(f"Remove {name} from this system (asks for confirmation)")
             rb.clicked.connect(
                 lambda _, c=cmd_remove, n=name, r=risk:
@@ -2144,8 +2242,8 @@ class FindingsTable(QWidget, WorkerMixin):
         if cmd_disable:
             db = QPushButton("DISABLE")
             db.setObjectName("warn")
-            db.setMinimumWidth(80)
-            db.setFixedHeight(28)
+            db.setMinimumWidth(66)
+            db.setFixedHeight(22)
             db.setToolTip(f"Disable {name} so it no longer runs (asks for confirmation)")
             db.clicked.connect(
                 lambda _, c=cmd_disable, n=name, r=risk:
@@ -2234,7 +2332,7 @@ class FindingsTable(QWidget, WorkerMixin):
         # Build the ACTIONS cell — explain + ignore + remove/disable buttons
         cell = self._build_action_cell(name, ftype, risk, detail, cmd_remove, cmd_disable)
         self.table.setCellWidget(row, 5, cell)
-        self.table.setRowHeight(row, 42)  # Tall enough to show buttons properly
+        self.table.setRowHeight(row, 34)  # Tight row; buttons are 22px
 
         # Keep findings sorted: HIGH at top, then MEDIUM, LOW, INFO
         if self._bulk_depth == 0:
@@ -2311,7 +2409,7 @@ class FindingsTable(QWidget, WorkerMixin):
                     action.get("cmd_disable"),
                 )
             )
-            self.table.setRowHeight(i, 42)
+            self.table.setRowHeight(i, 34)
 
     def _ignore(self, name):
         """Remove a finding from the table and add it to the ignore list."""
@@ -2828,16 +2926,67 @@ def run_drive_health_check(terminal, findings, parent_widget):
     "back up now" event, so we never bury the output behind silent sudo."""
     terminal.append("\nDrive Health Check (SMART)\n" + "─" * 50, T["ACCENT"])
 
+    # If smartmontools is missing, offer to install it on the spot — smartctl
+    # is a hard requirement for this scan. We capture the sudo password here
+    # and reuse it for the scan itself so the user is only prompted once.
+    cached_pw = None
     if not shutil.which("smartctl"):
-        msg = ("smartmontools is not installed. Install it from the Tools "
-               "panel (or: sudo apt install smartmontools).")
-        terminal.append_warn(msg)
-        findings.add_finding(
-            "smartmontools not installed", "HARDWARE", "INFO", msg,
-            "apt-get install smartmontools"
+        reply = QMessageBox.question(
+            parent_widget,
+            "smartmontools Required",
+            "This scan reads SMART health data using the `smartctl` "
+            "command, which is part of the `smartmontools` package — "
+            "and it's not installed.\n\n"
+            "Install it now?  (Runs: sudo apt install -y smartmontools)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
         )
-        SESSION.log_scan("Drive Health Check", 0)
-        return 0
+        if reply != QMessageBox.StandardButton.Yes:
+            terminal.append_info(
+                "Drive health check cancelled — smartmontools is required."
+            )
+            SESSION.log_scan("Drive Health Check", 0)
+            return 0
+
+        pw = prompt_for_sudo_password(
+            parent_widget,
+            "Installing smartmontools requires sudo.",
+            terminal=terminal,
+        )
+        if pw is None:
+            terminal.append_info(
+                "Drive health check cancelled — no sudo password supplied."
+            )
+            SESSION.log_scan("Drive Health Check", 0)
+            return 0
+
+        install_cmd = pkg_install("smartmontools")
+        terminal.append(
+            f"📦  Installing smartmontools: sudo {' '.join(install_cmd)}",
+            T["ACCENT"],
+        )
+        try:
+            r = subprocess.run(
+                ["sudo", "-S"] + install_cmd,
+                input=pw + b"\n",
+                capture_output=True,
+                timeout=180,
+            )
+        except Exception as e:
+            terminal.append_err(f"Install failed: {e}")
+            SESSION.log_scan("Drive Health Check", 0)
+            return 0
+
+        if r.returncode != 0 or not shutil.which("smartctl"):
+            terminal.append_err(
+                f"Install failed (exit {r.returncode}): "
+                f"{(r.stderr or b'').decode(errors='replace').strip()}"
+            )
+            SESSION.log_scan("Drive Health Check", 0)
+            return 0
+
+        terminal.append_ok("smartmontools installed successfully.")
+        cached_pw = pw   # reuse for the scan so we don't prompt twice
 
     drives = _list_physical_drives()
     if not drives:
@@ -2855,12 +3004,17 @@ def run_drive_health_check(terminal, findings, parent_widget):
         T["WARN"],
     )
 
-    pw = prompt_for_sudo_password(
-        parent_widget,
-        f"Drive health check needs sudo to read SMART data from "
-        f"{len(drives)} drive(s). READ-ONLY — nothing is written.",
-        terminal=terminal,
-    )
+    # Reuse the password from the install step if we just installed
+    # smartmontools — no point asking twice in a row.
+    if cached_pw is not None:
+        pw = cached_pw
+    else:
+        pw = prompt_for_sudo_password(
+            parent_widget,
+            f"Drive health check needs sudo to read SMART data from "
+            f"{len(drives)} drive(s). READ-ONLY — nothing is written.",
+            terminal=terminal,
+        )
     if pw is None:
         terminal.append_info(
             "Drive health check cancelled — no sudo password supplied."
@@ -3524,22 +3678,32 @@ class LynisPanel(QWidget, WorkerMixin):
             return
 
         self.output.clear()
-        self.status.setText("Running Lynis audit — please wait approximately 60 seconds...")
+        self.status.setText("Running Lynis audit — streaming progress below...")
         self.terminal.append_cmd("sudo lynis audit system --quick")
         self._lappend("Running Lynis security audit...", T["ACCENT"])
         self._lappend("This checks your system against security best practices.\n", T["TEXT_DIM"])
 
-        w = CommandWorker(
+        # StreamingCommandWorker pumps stdout line-by-line so the user sees
+        # Lynis actually doing work during its 60-second run, instead of a
+        # silent pause followed by a dump at the end.
+        w = StreamingCommandWorker(
             ["lynis", "audit", "system", "--quick"],
             sudo=True,
             timeout=200,
-            password=sudo_password
+            password=sudo_password,
         )
-        w.output_ready.connect(self._parse_lynis_output)
+        # Pipe each streamed line to the shared terminal so there's visible
+        # progress while the audit runs.
+        w.output_ready.connect(lambda t: self.terminal.append(t))
         w.error_ready.connect(lambda t: self._lappend(t, T["DANGER"]))
-        w.finished_ok.connect(lambda: self.status.setText("Lynis audit complete — see results above."))
-        # Also clear the "Please wait" indicator in the shared terminal so the
-        # user sees a completion line next to the running line.
+        # Parse once, after completion — using the full accumulated output
+        # so findings are consistent (no double-counting from partial emissions).
+        w.finished_ok.connect(
+            lambda worker=w: self._parse_lynis_output(getattr(worker, "full_output", ""))
+        )
+        w.finished_ok.connect(
+            lambda: self.status.setText("Lynis audit complete — see results above.")
+        )
         w.finished_ok.connect(
             lambda: self.terminal.append_ok("Lynis Full Audit complete.")
         )
@@ -3619,6 +3783,16 @@ class LynisPanel(QWidget, WorkerMixin):
                 self.findings.add_finding(
                     s[:60], "HARDENING", "LOW",
                     f"Lynis suggestion: {s}"
+                )
+
+            # Surface a visible INFO row in the main findings table even when
+            # Lynis flagged nothing — without it the user sees a blank table
+            # and can't tell the audit actually ran.
+            if not warns and not suggs:
+                idx_text = f" (hardening index {idx}/100)" if idx is not None else ""
+                self.findings.add_finding(
+                    "Lynis full audit", "HARDENING", "INFO",
+                    f"✔ Clean — 0 warnings, 0 suggestions{idx_text}."
                 )
 
             SESSION.log_scan("Lynis Full Audit", len(warns))
@@ -3962,10 +4136,22 @@ class CvePanel(QWidget, WorkerMixin):
 
     def _parse_upgrades(self, text):
         """Parse apt upgrade output and add outdated packages to findings.
-        apt list --upgradable lines look like:
-          pkg/noble-updates 1.2.3 amd64 [upgradable from: 1.2.2]
-        The old filter excluded any line containing 'upgradable' which removed
-        every result. Now we skip only the plain 'Listing...' header line."""
+
+        `CommandWorker` emits `output_ready` for BOTH stdout AND stderr when
+        the command exits 0, so this slot is called twice for a single run
+        — once with the real package list and once with apt's stability
+        warning. Without a guard the warning chunk would print a spurious
+        'No updates available' AFTER findings had already been added, making
+        the risk score disagree with the message in the terminal."""
+        stripped = text.strip()
+        # Skip apt's stderr warning chunk and anything that isn't the real
+        # `apt list --upgradable` output. The real output always starts with
+        # 'Listing' (header) or contains at least one 'pkg/release ...' line.
+        if not stripped or "Listing" not in text and "/" not in text:
+            return
+        if stripped.upper().startswith("WARNING"):
+            return
+
         lines = [
             l for l in text.splitlines()
             if "/" in l and not l.startswith("Listing")
@@ -4000,15 +4186,16 @@ class CvePanel(QWidget, WorkerMixin):
 # ── Recommended tools panel ───────────────────────────────────────────────────
 class ToolCard(QFrame):
     """A single card showing one recommended security/monitoring tool.
-    Shows: name, category, description, install status, and action buttons."""
+    Compact single-row layout: [cat badge] · name + desc · status · action
+    buttons. The name uses ACCENT instead of TEXT_MAIN because TEXT_MAIN on
+    some themes (notably Solarized) is intentionally muted and made tool
+    names hard to read against the card background."""
 
-    # Widths chosen so the longest label in each column fits without clipping
-    # at the default BASE_FS of 13px: "Monitoring" (category),
-    # "✗ Not installed" (status), "HOW TO USE"/"REINSTALL" (buttons).
-    CAT_WIDTH    = 96
-    STATUS_WIDTH = 120
-    BTN_WIDTH    = 115
-    BTN_HEIGHT   = 28
+    CAT_WIDTH     = 78
+    STATUS_WIDTH  = 96
+    BTN_WIDTH     = 72
+    BTN_WIDTH_SM  = 52
+    BTN_HEIGHT    = 24
 
     def __init__(self, tool_data, terminal):
         super().__init__()
@@ -4016,15 +4203,13 @@ class ToolCard(QFrame):
         self.terminal = terminal
         self._workers = set()
 
-        # Background/border handled via make_style() #tool_card — no inline style needed
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setObjectName("tool_card")
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(8)
 
-        # Category colour badge
         cat_colours = {
             "Security":   T["DANGER"],
             "Monitoring": T["ACCENT"],
@@ -4039,58 +4224,49 @@ class ToolCard(QFrame):
             f"color:{cat_colours.get(tool_data['cat'], T['TEXT_DIM'])};"
             f"font-size:{fs(-2)}px;font-weight:bold;"
         )
-        layout.addWidget(cat_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(cat_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # Name and description
         info_col = QVBoxLayout()
-        info_col.setSpacing(2)
+        info_col.setSpacing(1)
         name_lbl = QLabel(tool_data["name"])
-        name_lbl.setWordWrap(True)
         name_lbl.setStyleSheet(
-            f"color:{T['TEXT_MAIN']};font-weight:bold;font-size:{fs()}px;"
+            f"color:{T['ACCENT']};font-weight:bold;font-size:{fs()}px;"
         )
         info_col.addWidget(name_lbl)
         desc_lbl = QLabel(tool_data["desc"])
         desc_lbl.setStyleSheet(
-            f"color:{T['TEXT_DIM']};font-size:{fs(-2)}px;"
+            f"color:{T['TEXT_MAIN']};font-size:{fs(-2)}px;"
         )
         desc_lbl.setWordWrap(True)
         info_col.addWidget(desc_lbl)
         layout.addLayout(info_col, 1)
 
-        # Install status indicator
         self.status_lbl = QLabel("Checking...")
         self.status_lbl.setFixedWidth(self.STATUS_WIDTH)
-        self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet(f"font-size:{fs(-2)}px;")
-        layout.addWidget(self.status_lbl, 0, Qt.AlignmentFlag.AlignTop)
-
-        # Action buttons
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(4)
+        layout.addWidget(self.status_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.install_btn = QPushButton("INSTALL")
         self.install_btn.setObjectName("ok")
         self.install_btn.setFixedSize(self.BTN_WIDTH, self.BTN_HEIGHT)
         self.install_btn.setToolTip(f"Install {tool_data['name']} using {PKG_MGR}")
         self.install_btn.clicked.connect(self._install)
-        btn_col.addWidget(self.install_btn)
+        layout.addWidget(self.install_btn)
 
-        how_btn = QPushButton("HOW TO USE")
+        how_btn = QPushButton("HELP")
         how_btn.setObjectName("neutral")
-        how_btn.setFixedSize(self.BTN_WIDTH, self.BTN_HEIGHT)
+        how_btn.setFixedSize(self.BTN_WIDTH_SM, self.BTN_HEIGHT)
         how_btn.setToolTip(f"Show setup and usage guide for {tool_data['name']}")
         how_btn.clicked.connect(self._show_how_to_use)
-        btn_col.addWidget(how_btn)
+        layout.addWidget(how_btn)
 
-        run_btn = QPushButton("RUN NOW")
+        run_btn = QPushButton("RUN")
         run_btn.setObjectName("neutral")
-        run_btn.setFixedSize(self.BTN_WIDTH, self.BTN_HEIGHT)
+        run_btn.setFixedSize(self.BTN_WIDTH_SM, self.BTN_HEIGHT)
         run_btn.setToolTip(f"Run {tool_data['name']} now in the terminal")
         run_btn.clicked.connect(self._run_tool)
-        btn_col.addWidget(run_btn)
+        layout.addWidget(run_btn)
 
-        layout.addLayout(btn_col)
         self._check_installed()
 
     def _check_installed(self):
@@ -4105,7 +4281,7 @@ class ToolCard(QFrame):
         else:
             self.status_lbl.setText("✗ Not installed")
             self.status_lbl.setStyleSheet(
-                f"color:{T['TEXT_DIM']};font-size:{fs(-2)}px;"
+                f"color:{T['WARN']};font-size:{fs(-2)}px;font-weight:bold;"
             )
 
     def _install(self):
@@ -4212,13 +4388,191 @@ class ToolCard(QFrame):
         w.start()
 
 
+class ScheduleScanDialog(QDialog):
+    """Lightweight cron-based scheduler for recurring audit checks.
+
+    Writes a single marker-suffixed line to the current user's crontab so
+    previous schedules are easy to find and remove. No sudo required — the
+    entry runs under the logged-in user. The scheduled command itself
+    (`apt list --upgradable`) is read-only; nothing is installed, changed,
+    or removed."""
+
+    MARKER = "# audit-dashboard-schedule"
+    LOG    = "~/.audit-dashboard-schedule.log"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Schedule Security Scans (cron)")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+
+        hdr = QLabel("📅  Schedule Automated Checks")
+        hdr.setObjectName("heading")
+        layout.addWidget(hdr)
+
+        info = QLabel(
+            "Write a crontab entry for your user that runs "
+            "`apt list --upgradable` on the schedule below and appends the "
+            "result to ~/.audit-dashboard-schedule.log. No sudo is used; "
+            "nothing is installed or modified."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color:{T['TEXT_DIM']};font-size:{fs(-1)}px;padding:4px 0 10px 0;"
+        )
+        layout.addWidget(info)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Frequency:"))
+        self.freq_combo = QComboBox()
+        self.freq_combo.addItems(["Daily", "Weekly (Sundays)", "Monthly (1st)"])
+        row.addWidget(self.freq_combo)
+
+        row.addSpacing(16)
+        row.addWidget(QLabel("at"))
+        self.time_edit = QTimeEdit()
+        self.time_edit.setTime(QTime(9, 0))
+        self.time_edit.setDisplayFormat("HH:mm")
+        row.addWidget(self.time_edit)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.current_lbl = QLabel()
+        self.current_lbl.setWordWrap(True)
+        self.current_lbl.setStyleSheet(
+            f"color:{T['ACCENT']};padding:8px 0;font-size:{fs(-1)}px;"
+        )
+        layout.addWidget(self.current_lbl)
+        self._refresh_current_label()
+
+        btns = QDialogButtonBox()
+        self.install_btn = btns.addButton(
+            "Install Schedule", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.remove_btn  = btns.addButton(
+            "Remove Scheduled Scan", QDialogButtonBox.ButtonRole.DestructiveRole
+        )
+        close_btn = btns.addButton(
+            "Close", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        self.install_btn.clicked.connect(self._install)
+        self.remove_btn.clicked.connect(self._remove)
+        close_btn.clicked.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _read_current(self):
+        """Return the existing schedule line if one is installed, else None."""
+        try:
+            r = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=5
+            )
+            if r.returncode != 0:
+                return None
+            for line in r.stdout.splitlines():
+                if self.MARKER in line:
+                    return line
+        except Exception:
+            pass
+        return None
+
+    def _refresh_current_label(self):
+        line = self._read_current()
+        if line:
+            self.current_lbl.setText(f"Currently scheduled:\n{line}")
+        else:
+            self.current_lbl.setText("No scheduled scan currently installed.")
+
+    def _build_line(self):
+        t = self.time_edit.time()
+        freq = self.freq_combo.currentIndex()
+        schedule = {
+            0: f"{t.minute()} {t.hour()} * * *",
+            1: f"{t.minute()} {t.hour()} * * 0",
+            2: f"{t.minute()} {t.hour()} 1 * *",
+        }[freq]
+        cmd = (
+            f"apt list --upgradable > {self.LOG} 2>&1; "
+            f"date >> {self.LOG}"
+        )
+        return f"{schedule} {cmd} {self.MARKER}"
+
+    def _write_crontab(self, new_cron_text):
+        try:
+            p = subprocess.run(
+                ["crontab", "-"], input=new_cron_text, text=True,
+                capture_output=True, timeout=5,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Failed", f"Could not write crontab: {e}")
+            return False
+        if p.returncode != 0:
+            QMessageBox.warning(
+                self, "Failed",
+                f"crontab returned {p.returncode}:\n{p.stderr or p.stdout}"
+            )
+            return False
+        return True
+
+    def _install(self):
+        try:
+            r = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=5
+            )
+            existing = r.stdout if r.returncode == 0 else ""
+        except Exception as e:
+            QMessageBox.warning(self, "Failed", f"Could not read crontab: {e}")
+            return
+        kept = [l for l in existing.splitlines() if self.MARKER not in l]
+        kept.append(self._build_line())
+        if not self._write_crontab("\n".join(kept) + "\n"):
+            return
+        QMessageBox.information(self, "Scheduled", "Scheduled scan installed.")
+        self._refresh_current_label()
+
+    def _remove(self):
+        try:
+            r = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=5
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Failed", f"Could not read crontab: {e}")
+            return
+        if r.returncode != 0 and "no crontab" not in (r.stderr or "").lower():
+            QMessageBox.warning(
+                self, "Failed",
+                f"Could not read crontab: {r.stderr or 'unknown error'}"
+            )
+            return
+        existing = r.stdout if r.returncode == 0 else ""
+        kept = [l for l in existing.splitlines() if self.MARKER not in l]
+        if len(kept) == len(existing.splitlines()):
+            QMessageBox.information(
+                self, "Nothing to Remove",
+                "No scheduled scan found in your crontab."
+            )
+            return
+        new_text = "\n".join(kept) + ("\n" if kept else "")
+        if not self._write_crontab(new_text):
+            return
+        QMessageBox.information(self, "Removed", "Scheduled scan removed.")
+        self._refresh_current_label()
+
+
 class ToolsPanel(QWidget):
-    """Shows the 15 recommended tools as a scrollable card list.
-    Users can install, see setup instructions, and run tools directly."""
+    """Recommended tools grouped by category. A row of category tabs at the
+    top acts as a menu — clicking one shows only that category's cards.
+    The Monitoring tab also shows a special 'Schedule Automated Checks'
+    card that opens `ScheduleScanDialog`."""
+
+    CATEGORIES = ["All", "Monitoring", "Health", "Security",
+                  "Network", "Backup", "Storage"]
 
     def __init__(self, terminal):
         super().__init__()
-        self.terminal = terminal
+        self.terminal        = terminal
+        self.active_category = "All"
+        self._filter_text    = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -4232,25 +4586,48 @@ class ToolsPanel(QWidget):
         info.setStyleSheet(f"color:{T['TEXT_DIM']};font-size:{fs(-1)}px;")
         layout.addWidget(info)
 
-        # Filter box to find tools quickly
+        # Category tab row — exclusive selection acts like a top menu
+        cat_row = QHBoxLayout()
+        cat_row.setSpacing(4)
+        cat_row.setContentsMargins(0, 4, 0, 4)
+        self.cat_buttons = {}
+        for cat in self.CATEGORIES:
+            b = QPushButton(cat)
+            b.setCheckable(True)
+            b.setFixedHeight(26)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _, c=cat: self._set_category(c))
+            cat_row.addWidget(b)
+            self.cat_buttons[cat] = b
+        cat_row.addStretch()
+        layout.addLayout(cat_row)
+        self.cat_buttons["All"].setChecked(True)
+        self._style_cat_buttons()
+
+        # Text filter — kept alongside category tabs for quick name search
         hrow = QHBoxLayout()
         filter_box = QLineEdit()
-        filter_box.setPlaceholderText("Filter tools by name or category...")
-        filter_box.setFixedWidth(240)
-        filter_box.textChanged.connect(self._filter)
+        filter_box.setPlaceholderText("Filter current category by name...")
+        filter_box.setFixedWidth(260)
+        filter_box.textChanged.connect(self._on_filter_text)
         hrow.addWidget(filter_box)
         hrow.addStretch()
         layout.addLayout(hrow)
 
-        # Scrollable card list
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border:none;")
         container = QWidget()
         self.cards_layout = QVBoxLayout(container)
         self.cards_layout.setSpacing(4)
-        self.cards = []
+        self.cards_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Special card: Schedule Automated Checks (lives in Monitoring)
+        self._schedule_card = self._build_schedule_card()
+        self._schedule_card.tool = {"cat": "Monitoring", "name": "schedule-scans"}
+        self.cards_layout.addWidget(self._schedule_card)
+
+        self.cards = []
         for tool in TOOLS_DATA:
             card = ToolCard(tool, terminal)
             self.cards_layout.addWidget(card)
@@ -4260,16 +4637,100 @@ class ToolsPanel(QWidget):
         scroll.setWidget(container)
         layout.addWidget(scroll)
 
-    def _filter(self, text):
-        """Show only tool cards matching the filter text."""
-        text = text.lower()
+        self._apply_filters()
+
+    def _build_schedule_card(self):
+        """Build the special Monitoring card that opens the cron scheduler."""
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame.setObjectName("tool_card")
+
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(8, 5, 8, 5)
+        row.setSpacing(8)
+
+        badge = QLabel("Monitoring")
+        badge.setFixedWidth(78)
+        badge.setStyleSheet(
+            f"color:{T['ACCENT']};font-size:{fs(-2)}px;font-weight:bold;"
+        )
+        row.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(1)
+        name_lbl = QLabel("📅  Schedule Automated Checks")
+        name_lbl.setStyleSheet(
+            f"color:{T['ACCENT']};font-weight:bold;font-size:{fs()}px;"
+        )
+        info_col.addWidget(name_lbl)
+        desc_lbl = QLabel(
+            "Install a cron job that runs an upgradable-packages check "
+            "on a daily, weekly, or monthly schedule and writes the "
+            "result to a log file in your home directory."
+        )
+        desc_lbl.setStyleSheet(
+            f"color:{T['TEXT_MAIN']};font-size:{fs(-2)}px;"
+        )
+        desc_lbl.setWordWrap(True)
+        info_col.addWidget(desc_lbl)
+        row.addLayout(info_col, 1)
+
+        spacer = QLabel("")
+        spacer.setFixedWidth(96)
+        row.addWidget(spacer)
+
+        btn = QPushButton("OPEN SCHEDULER")
+        btn.setObjectName("ok")
+        btn.setFixedSize(148, 24)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda: ScheduleScanDialog(self).exec())
+        row.addWidget(btn)
+
+        return frame
+
+    def _style_cat_buttons(self):
+        """Visual distinction for active vs inactive category tabs."""
+        for b in self.cat_buttons.values():
+            if b.isChecked():
+                b.setStyleSheet(
+                    f"background:{T['ACCENT']};color:{T['BG_DARK']};"
+                    f"border:1px solid {T['ACCENT']};border-radius:4px;"
+                    f"padding:2px 10px;font-weight:bold;"
+                )
+            else:
+                b.setStyleSheet(
+                    f"background:{T['BG_CARD']};color:{T['TEXT_MAIN']};"
+                    f"border:1px solid {T['BORDER']};border-radius:4px;"
+                    f"padding:2px 10px;"
+                )
+
+    def _set_category(self, cat):
+        for c, b in self.cat_buttons.items():
+            b.setChecked(c == cat)
+        self.active_category = cat
+        self._style_cat_buttons()
+        self._apply_filters()
+
+    def _on_filter_text(self, text):
+        self._filter_text = text.lower()
+        self._apply_filters()
+
+    def _apply_filters(self):
+        txt = self._filter_text
+        active = self.active_category
+        # Schedule card only appears under Monitoring / All
+        self._schedule_card.setVisible(
+            active in ("All", "Monitoring")
+            and (not txt or txt in "schedule automated checks monitoring")
+        )
         for card in self.cards:
-            matches = (
-                text in card.tool["name"].lower() or
-                text in card.tool["cat"].lower() or
-                text in card.tool["desc"].lower()
+            cat = card.tool["cat"]
+            name = card.tool["name"].lower()
+            visible = (
+                (active == "All" or active == cat)
+                and (not txt or txt in name or txt in cat.lower())
             )
-            card.setVisible(not text or matches)
+            card.setVisible(visible)
 
 
 # ── Undo / Rollback panel (lives inside the main tab widget) ──────────────────
@@ -4606,10 +5067,12 @@ class SideBar(QWidget, WorkerMixin):
             sub_lbl.setObjectName("section_sub")
             sub_lbl.setWordWrap(True)
 
-            # Content container — buttons go inside here
+            # Content container — buttons go inside here. Indent left so
+            # expanded sections visually read as a menu "tree": you see the
+            # section as a parent and its buttons as children underneath.
             content   = QWidget()
             content_l = QVBoxLayout(content)
-            content_l.setContentsMargins(0, 0, 0, 0)
+            content_l.setContentsMargins(14, 0, 0, 0)
             content_l.setSpacing(0)
             content.setVisible(is_expanded)
             sub_lbl.setVisible(is_expanded)
@@ -4630,6 +5093,11 @@ class SideBar(QWidget, WorkerMixin):
             self._update_section_header(section_id, is_expanded)
             return content_l
 
+        # Track every sidebar menu button so we can flip the "active" style
+        # off on the previously-selected one when a new one is clicked.
+        self._menu_buttons = []
+        self._active_menu_btn = None
+
         # ── Helper: add a button into a section content layout ────────────
         def btn(label_key, tooltip, handler, parent_layout=None,
                 style="section_btn", shortcut=None):
@@ -4638,11 +5106,15 @@ class SideBar(QWidget, WorkerMixin):
             b.setFixedHeight(42)
             b.setToolTip(tooltip)
             b.clicked.connect(handler)
+            # Mark as active on click — visual follows user intent whether
+            # the handler opens a panel, runs a scan, or launches a dialog.
+            b.clicked.connect(lambda _, bb=b: self._mark_active_btn(bb))
             if shortcut:
                 b.setShortcut(QKeySequence(shortcut))
                 b.setToolTip(f"{tooltip} [{shortcut}]")
             target = parent_layout if parent_layout is not None else layout
             target.addWidget(b)
+            self._menu_buttons.append(b)
             return b
 
         # ── SCAN YOUR SYSTEM ──────────────────────────────────────────────
@@ -4767,6 +5239,25 @@ class SideBar(QWidget, WorkerMixin):
         built.setWordWrap(True)
         il.addWidget(built)
         root_layout.addWidget(info_box, 0)
+
+    def _mark_active_btn(self, btn):
+        """Visually mark one sidebar menu button as the current selection.
+        A thick accent-coloured left border makes it obvious which item
+        the user just picked, even after the panel switches."""
+        for b in self._menu_buttons:
+            # Reset every other button to its section-btn default style.
+            b.setStyleSheet("")
+        btn.setStyleSheet(
+            f"QPushButton#section_btn {{"
+            f"  text-align: left;"
+            f"  padding-left: 12px;"
+            f"  background: {T['BG_CARD']};"
+            f"  color: {T['ACCENT']};"
+            f"  border-left: 4px solid {T['ACCENT']};"
+            f"  font-weight: bold;"
+            f"}}"
+        )
+        self._active_menu_btn = btn
 
     def _update_section_header(self, section_id, expanded):
         """Refresh section header text with arrow + completion tick."""
@@ -5328,7 +5819,7 @@ class StartupWizard(QDialog):
             "  •  Open network ports that could be risky\n"
             "  •  Security configuration — firewall, SSH, kernel settings\n"
             "  •  Known CVE vulnerabilities in your installed software\n\n"
-            "Everything is explained in plain English before any action is taken.\n\n"
+            "Everything is explained in everyday language before any action is taken.\n\n"
             "Nothing on your system is changed without your explicit confirmation.\n"
             "You will always see exactly what command will run before it does.\n\n"
             "This is not a magic fix — it gives you information and options.\n"
@@ -5350,7 +5841,7 @@ class StartupWizard(QDialog):
         mode_box = QGroupBox("Display Mode")
         ml = QVBoxLayout(mode_box)
         self.simple_rb = QRadioButton(
-            "Simple Mode — Plain English, essential findings only.\n"
+            "Simple Mode — Everyday Language, essential findings only.\n"
             "    Hides technical detail and low-priority items.\n"
             "    Recommended for most users."
         )
@@ -5426,7 +5917,7 @@ class StartupWizard(QDialog):
         tip = QLabel(
             "\nTips for getting started:\n\n"
             "  •  Click 'RUN FULL SCAN' on the left sidebar to begin\n"
-            "  •  Double-click any finding for a plain English explanation\n"
+            "  •  Double-click any finding for a everyday language explanation\n"
             "  •  Nothing changes until you click REMOVE or DISABLE and confirm\n"
             "  •  The face at the top improves as you fix issues\n"
             "  •  Use the ? button on any finding to understand it better"
@@ -5450,7 +5941,7 @@ class StartupWizard(QDialog):
             pl = PROFILES.get(self.profile, {}).get("label", "Unknown")
             self.summary_lbl.setText(
                 f"Profile:         {pl}\n"
-                f"Display Mode:    {'Simple — plain English, essential findings only' if self.mode == 'simple' else 'Expert — full technical detail'}\n"
+                f"Display Mode:    {'Simple — everyday language, essential findings only' if self.mode == 'simple' else 'Expert — full technical detail'}\n"
                 f"Connectivity:    {'Online — CVE vulnerability checks enabled' if self.online else 'Offline — local scans only'}\n\n"
                 f"Click 'Start Scanning' to begin."
             )
@@ -5471,7 +5962,7 @@ class StartupWizard(QDialog):
 
 # ── Session summary dialog ────────────────────────────────────────────────────
 class SessionSummaryDialog(QDialog):
-    """Popup showing a plain English summary of everything done this session.
+    """Popup showing a everyday language summary of everything done this session.
     Triggered by the 'SESSION SUMMARY' toolbar button."""
 
     def __init__(self, parent=None):
@@ -5485,7 +5976,7 @@ class SessionSummaryDialog(QDialog):
         layout.addWidget(title)
 
         info = QLabel(
-            "A plain English breakdown of everything that happened this session."
+            "A everyday language breakdown of everything that happened this session."
         )
         info.setStyleSheet(f"color:{T['TEXT_DIM']};font-size:{fs(-1)}px;")
         layout.addWidget(info)
@@ -5975,7 +6466,7 @@ Mode: {"Executive" if mode == "executive" else "Technical"}
 
 <h2>Overall Assessment</h2>
 <div class="exec-box">
-  <h2>In Plain English</h2>
+  <h2>In Everyday Language</h2>
   {exec_block}
 </div>
 <div style="margin:8px 0;">
@@ -6152,7 +6643,7 @@ class AuditDashboard(QMainWindow):
         # Toolbar action buttons
         for lbl3, tip3, handler3 in [
             ("▶  RUN EVERYTHING",    "Run every non-sudo scan and show an at-a-glance assessment of what's good and what needs fixing", self._run_everything),
-            ("📋  What's Been Done?", "Plain English summary of everything done this session", self._show_session_summary),
+            ("📋  What's Been Done?", "Everyday Language summary of everything done this session", self._show_session_summary),
             ("👤  CHANGE PROFILE",   "Re-detect or manually select your system profile",       self._detect_profile),
             ("📄  REPORT",           "Generate a detailed HTML security report",                self._generate_report),
             ("{ }  SHOW CODE",       "See every command this app can run — full transparency",  self._show_code),
@@ -6229,7 +6720,7 @@ class AuditDashboard(QMainWindow):
         self.setStatusBar(sb)
         sb.showMessage(
             "Ready  |  Ctrl+R = Full Scan  |  Ctrl+1-5 = Individual Scans  |  "
-            "Double-click any finding for a plain English explanation  |  "
+            "Double-click any finding for a everyday language explanation  |  "
             "Drag the bar between panels to resize"
         )
 
@@ -6286,7 +6777,7 @@ class AuditDashboard(QMainWindow):
         save_config("prefs", "mode", "expert" if self.expert_mode else "simple")
         self.terminal.append_ok(
             "Expert mode — full technical detail shown" if self.expert_mode
-            else "Simple mode — plain English, essential findings only"
+            else "Simple mode — everyday language, essential findings only"
         )
 
     def _change_theme(self, name):
@@ -6376,7 +6867,7 @@ class AuditDashboard(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel("Choose report style:"))
         exec_rb = QRadioButton(
-            "👤  Executive — Plain English summary with key stats\n"
+            "👤  Executive — Everyday Language summary with key stats\n"
             "    Good for sharing with non-technical people"
         )
         exec_rb.setChecked(True)
