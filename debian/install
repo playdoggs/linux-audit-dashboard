@@ -1,0 +1,4 @@
+linux-security-dashboard.py             usr/lib/linux-security-dashboard/
+packaging/linux-security-dashboard       usr/bin/
+packaging/linux-security-dashboard.desktop  usr/share/applications/
+packaging/linux-security-dashboard.svg   usr/share/icons/hicolor/scalable/apps/

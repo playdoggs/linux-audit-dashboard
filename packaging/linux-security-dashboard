@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher installed at /usr/bin/linux-security-dashboard.
+# The actual script lives under /usr/lib so /usr/bin stays free of .py noise.
+exec python3 /usr/lib/linux-security-dashboard/linux-security-dashboard.py "$@"

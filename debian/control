@@ -1,0 +1,40 @@
+Source: linux-security-dashboard
+Section: admin
+Priority: optional
+Maintainer: playdoggs <playdoggs@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/playdoggs/linux-security-dashboard
+Rules-Requires-Root: no
+
+Package: linux-security-dashboard
+Architecture: all
+Depends: ${misc:Depends},
+         python3 (>= 3.10),
+         python3-pyqt6,
+         libxcb-cursor0
+Recommends: deborphan,
+            lynis,
+            smartmontools,
+            lm-sensors
+Suggests: timeshift,
+          rkhunter,
+          chkrootkit,
+          fail2ban,
+          unattended-upgrades
+Description: GUI Linux security audit tool with everyday-language explanations
+ Linux Security Dashboard is a PyQt6 desktop application that audits Linux
+ security posture in everyday language. Designed for users who want to
+ understand whether their system is safe without needing a cybersecurity
+ background.
+ .
+ Features:
+  * Everyday-language explanations of every finding
+  * One-click guided fixes with confirmation dialogs
+  * Live risk score with per-section breakdown
+  * Hardware temperature (lm-sensors) and SMART drive health checks
+  * Optional Timeshift snapshot before destructive actions
+  * Multi-language UI (12 languages including RTL Arabic)
+  * Full undo / rollback log persisted across sessions
+  * CVE lookup against the Ubuntu security tracker
+  * Integration with Lynis, deborphan, smartmontools, lm-sensors

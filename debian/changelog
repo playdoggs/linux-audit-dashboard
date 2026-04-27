@@ -1,0 +1,15 @@
+linux-security-dashboard (4.2.0-1) unstable; urgency=medium
+
+  * Initial Debian package release.
+  * v4.2 features:
+    - Hardware temperature checks via lm-sensors with threshold-aware findings.
+    - SMART drive health checks via smartmontools (read-only -H, never -t).
+    - Optional Timeshift snapshot before destructive actions; the action is
+      aborted if the snapshot fails so the safety net is guaranteed.
+    - RUN EVERYTHING chained assessment with a good/needs-fixing summary.
+    - Offline detection for CVE lookups and tool installs.
+    - Tools panel redesigned with category tabs and a cron scheduler card.
+    - Lynis output streams line-by-line as the audit runs.
+    - Persistent undo log; rollback matches on time+action+cmd+undo_cmd.
+
+ -- playdoggs <playdoggs@users.noreply.github.com>  Sun, 27 Apr 2026 10:00:00 +1000

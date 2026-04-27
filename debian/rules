@@ -1,0 +1,6 @@
+#!/usr/bin/make -f
+# Debian package build rules. Plain debhelper — no Python module
+# packaging needed because we ship a single script verbatim.
+
+%:
+	dh $@

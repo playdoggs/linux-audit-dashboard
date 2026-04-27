@@ -77,6 +77,21 @@ cd linux-security-dashboard
 python3 linux-security-dashboard.py
 ```
 
+### Build a `.deb` package
+
+```bash
+# One-time build dependencies
+sudo apt install build-essential debhelper devscripts lintian
+
+# From the repo root
+./build-deb.sh
+
+# Then install the resulting .deb (written to the parent directory)
+sudo apt install ../linux-security-dashboard_*.deb
+```
+
+After installing, launch from your desktop menu (**Linux Security Dashboard**) or run `linux-security-dashboard` from a terminal.
+
 ---
 
 ## Distro Support
@@ -145,8 +160,8 @@ python3 linux-security-dashboard.py
 - [x] Hardware temperature check (lm-sensors) — parses per-sensor thresholds into findings
 - [x] Drive health check (smartmontools) — read-only SMART self-assessment, never runs `-t`
 - [x] Optional Timeshift snapshot before destructive actions — aborts the action if the snapshot fails
+- [x] `.deb` package — `./build-deb.sh` builds an installable Debian package (`debian/` + `packaging/`)
 - [ ] Full Fedora/Arch parity (package manager hooks done; CVE/inventory scans still apt-only)
-- [ ] .deb package for easy install
 - [ ] PPA submission
 
 ---

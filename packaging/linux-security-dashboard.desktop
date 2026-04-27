@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Linux Security Dashboard
+GenericName=Security Audit Tool
+Comment=Audit your Linux system's security posture in everyday language
+Exec=linux-security-dashboard
+Icon=linux-security-dashboard
+Terminal=false
+Categories=System;Security;Utility;
+Keywords=security;audit;hardening;cve;lynis;firewall;
+StartupNotify=true
